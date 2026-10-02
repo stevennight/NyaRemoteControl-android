@@ -59,6 +59,15 @@ class RemoteSession(dataDir: String, config: StartConfig, private val onEvent: (
     fun wheel(dx: Int, dy: Int) = onHandle { NativeCore.wheel(it, dx, dy) }
     fun key(scancode: Int, extended: Boolean, down: Boolean) = onHandle { NativeCore.key(it, scancode, extended, down) }
     fun releaseAll() = onHandle { NativeCore.releaseAll(it) }
+    fun text(text: String) = onHandle { NativeCore.text(it, text) }
+    fun gamepad(index: Int, connected: Boolean, buttons: Int, lt: Int, rt: Int, lx: Int, ly: Int, rx: Int, ry: Int) =
+        onHandle { NativeCore.gamepad(it, index, connected, buttons, lt, rt, lx, ly, rx, ry) }
+    fun audioPush(seq: Int, senderUs: Long, pcm: ShortArray, samples: Int): Boolean =
+        onHandle { NativeCore.audioPush(it, seq, senderUs, pcm, samples) } ?: false
+    fun audioPull(maxFrames: Int, deviceQueued: Int, out: FloatArray): Int =
+        onHandle { NativeCore.audioPull(it, maxFrames, deviceQueued, out) } ?: 0
+    fun requestFiles(offerId: String) = onHandle { NativeCore.requestFiles(it, offerId) }
+    fun sendFiles(json: String) = onHandle { NativeCore.sendFiles(it, json) }
     fun updateStream(o: StreamOptions) = onHandle { NativeCore.updateStream(it, coreJson.encodeToString(StreamOptions.serializer(), o)) }
     fun setGameMode(game: Boolean) = onHandle { NativeCore.setMode(it, game) }
     fun sendSas() = onHandle { NativeCore.sendSas(it) }

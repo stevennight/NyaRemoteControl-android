@@ -92,6 +92,12 @@ class SessionUi(initialMode: ControlMode, showStats: Boolean, gameMode: Boolean,
     var stats by mutableStateOf<StatsLine?>(null)
     var stream by mutableStateOf<CoreEvent.StreamStarted?>(null)
     var role by mutableStateOf<CoreEvent.Role?>(null)
+    var fileTransfer by mutableStateOf(false)
+    var gamepad by mutableStateOf(false)
+    /** Files copied on the host, waiting for "save to phone". */
+    var offer by mutableStateOf<CoreEvent.FileOffer?>(null)
+    /** Upload / download in progress (or just finished). */
+    var transfer by mutableStateOf<CoreEvent.Transfer?>(null)
 }
 
 interface SessionActions {
@@ -105,6 +111,9 @@ interface SessionActions {
     fun sendClipboard()
     fun takeControl(kick: Boolean)
     fun resetZoom()
+    fun pickFiles()
+    fun acceptOffer()
+    fun dismissOffer()
     fun submitPairCode(code: String?)
     fun retry()
     fun disconnect()
@@ -123,6 +132,14 @@ fun SessionOverlay(ui: SessionUi, keys: KeyboardController, actions: SessionActi
             Status.Connecting -> StatusCard("正在连接 ${ui.hostName}…", Modifier.align(Alignment.Center))
             is Status.Reconnecting -> StatusCard("连接中断，正在重连…\n${s.message}", Modifier.align(Alignment.Center))
             else -> {}
+        }
+
+        Column(
+            Modifier.align(Alignment.BottomStart).padding(start = 16.dp, bottom = if (ui.keyboardOpen) 0.dp else 16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            ui.offer?.let { OfferBanner(it, actions) }
+            ui.transfer?.let { TransferChip(it) }
         }
 
         if (ui.keyboardOpen) {
@@ -163,6 +180,42 @@ fun SessionOverlay(ui: SessionUi, keys: KeyboardController, actions: SessionActi
     }
 }
 
+private fun sizeText(bytes: Long): String = when {
+    bytes >= 1L shl 30 -> "%.1f GB".format(bytes / (1L shl 30).toFloat())
+    bytes >= 1L shl 20 -> "%.1f MB".format(bytes / (1L shl 20).toFloat())
+    bytes >= 1L shl 10 -> "%.0f KB".format(bytes / (1L shl 10).toFloat())
+    else -> "$bytes B"
+}
+
+@Composable
+private fun OfferBanner(o: CoreEvent.FileOffer, actions: SessionActions) {
+    Row(
+        Modifier.background(Color(0xE6202226), RoundedCornerShape(14.dp)).padding(start = 14.dp, end = 4.dp, top = 4.dp, bottom = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        val what = o.files.singleOrNull()?.name ?: "${o.files.size} 项"
+        Text("电脑复制了 $what（${sizeText(o.totalBytes)}）", color = Color.White, fontSize = 13.sp)
+        TextButton(onClick = actions::acceptOffer) { Text("保存到手机", color = AccentCyan) }
+        TextButton(onClick = actions::dismissOffer) { Text("忽略", color = Color(0xFFB8BBC2)) }
+    }
+}
+
+@Composable
+private fun TransferChip(t: CoreEvent.Transfer) {
+    val text = when {
+        t.finished -> t.message
+        t.total > 0 -> "${if (t.upload) "发送" else "接收"} ${t.name}  ${(t.done * 100 / t.total).coerceIn(0, 100)}%"
+        t.message.isNotEmpty() -> "${t.name} ${t.message}"
+        else -> "${if (t.upload) "发送" else "接收"} ${t.name}  ${sizeText(t.done)}"
+    }
+    Text(
+        text,
+        Modifier.background(Color(0xCC202226), RoundedCornerShape(10.dp)).padding(horizontal = 12.dp, vertical = 8.dp),
+        color = if (t.finished && !t.ok) Color(0xFFFF8A80) else Color.White,
+        fontSize = 13.sp,
+    )
+}
+
 @Composable
 private fun StatusCard(text: String, modifier: Modifier) {
     Row(
@@ -186,6 +239,10 @@ private fun StatsText(ui: SessionUi, modifier: Modifier) {
         if (s.targetKbps > 0) append(" · 目标 %.1f Mbps".format(s.targetKbps / 1000f))
         if (s.fecPercent > 0) append(" · 纠错 ${s.fecPercent}%")
         if (s.framesLost + s.framesDropped > 0) append(" · 丢帧 ${s.framesLost + s.framesDropped}")
+        if (s.audioTargetMs > 0) {
+            append("\n声音缓冲 %.0f/%.0f ms".format(s.audioMs, s.audioTargetMs))
+            if (s.audioUnderruns > 0) append(" · 断音 ${s.audioUnderruns}")
+        }
         if (st != null) append("\n${st.codec} ${st.width}×${st.height} · ${st.encoder}")
     }
     Text(
@@ -312,6 +369,12 @@ private fun SidePanel(ui: SessionUi, actions: SessionActions) {
                     actions.setShowStats(!ui.showStats)
                 }
                 Tile("发送剪贴板", Modifier.weight(1f)) { actions.sendClipboard() }
+            }
+            if (ui.fileTransfer) {
+                Row(Modifier.fillMaxWidth().padding(top = 10.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Tile("发送文件到电脑", Modifier.weight(1f)) { actions.pickFiles() }
+                }
+                Text("在电脑上复制文件后，这里会提示保存到手机", fontSize = 12.sp, color = Color.Gray, modifier = Modifier.padding(top = 6.dp))
             }
         }
 

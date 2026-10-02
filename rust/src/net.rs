@@ -1,6 +1,7 @@
 //! Connection, handshake, pairing and the long-running session with automatic
 //! reconnection. A trimmed port of the Windows client's net.rs: video, audio,
-//! cursor, input, clipboard text and stream control; no files, USB, folders.
+//! cursor, input (keys, text, gamepads), clipboard text, file transfer and
+//! stream control; no USB, folder mount, printing or clipboard files.
 
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
@@ -41,6 +42,9 @@ pub fn local_version() -> LocalVersion {
         Feature::MultiStream,
         Feature::MultiClient,
         Feature::VideoDatagram,
+        Feature::FileTransfer,
+        Feature::Gamepad,
+        Feature::TextInput,
     ]
     .into_iter()
     .map(|f| f as u32)
@@ -123,6 +127,7 @@ struct Params {
     version: String,
     caps: pb::ClientCaps,
     start: pb::StartStream,
+    download_dir: Option<std::path::PathBuf>,
 }
 
 enum End {
@@ -163,6 +168,7 @@ pub async fn main(cfg: StartConfig, identity: Identity, sh: Arc<Shared>, mut cmd
         version: cfg.client_version.clone(),
         caps: cfg.caps(),
         start: cfg.stream.to_start(),
+        download_dir: cfg.download_dir.as_ref().map(std::path::PathBuf::from),
     };
     supervise(link, p, cmds, &sh).await;
 }
@@ -215,6 +221,9 @@ async fn supervise(first: Link, mut p: Params, mut cmds: mpsc::UnboundedReceiver
             server_version: l.welcome.server_version.clone(),
             server_fingerprint: l.server_fp.to_hex(),
             server_fingerprint_short: l.server_fp.short(),
+            text_input: l.neg.has(Feature::TextInput),
+            file_transfer: l.neg.has(Feature::FileTransfer),
+            gamepad: l.neg.has(Feature::Gamepad),
         });
         match run(l, &mut p, &mut cmds, sh).await {
             End::UserQuit => return sh.event(Event::Disconnected { message: "已断开".into() }),
@@ -255,7 +264,10 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
         Err(e) => return End::Lost(format!("{e:#}")),
     };
 
-    let uni = tokio::spawn(accept_uni(conn.clone(), sh.clone(), neg.has(Feature::MultiStream)));
+    let files_on = neg.has(Feature::FileTransfer);
+    let downloads = Arc::new(crate::files::Downloads::default());
+    let dl_dir = if files_on { p.download_dir.clone() } else { None };
+    let uni = tokio::spawn(accept_uni(conn.clone(), sh.clone(), neg.has(Feature::MultiStream), downloads.clone(), dl_dir));
     // The host opens bidi streams only for features we don't offer.
     let bidi = tokio::spawn({
         let conn = conn.clone();
@@ -290,6 +302,27 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
                     Some(Msg::ServerStats(s)) => sh.stats.on_server(s),
                     Some(Msg::ClipboardText(c)) if clipboard => sh.event(Event::Clipboard { text: c.text }),
                     Some(Msg::Pong(p)) => sh.stats.on_pong(p.t_us, p.server_t_us),
+                    Some(Msg::FileOffer(o)) if files_on => {
+                        tracing::info!("host offers {} item(s)", o.files.len());
+                        sh.event(downloads.offered(&o));
+                    }
+                    Some(Msg::FileResult(r)) => {
+                        if !r.ok {
+                            downloads.forget(r.transfer_id);
+                        }
+                        let message = if r.ok && !r.saved_to.is_empty() { format!("{}（{}）", r.message, r.saved_to) } else { r.message };
+                        sh.event(Event::Transfer {
+                            id: r.transfer_id.to_string(),
+                            upload: true,
+                            name: String::new(),
+                            done: 0,
+                            total: 0,
+                            finished: true,
+                            ok: r.ok,
+                            message,
+                        });
+                    }
+                    Some(Msg::GamepadRumble(r)) => sh.event(Event::Rumble { index: r.index, large: r.large_motor, small: r.small_motor }),
                     Some(Msg::Bye(b)) => break End::Fatal(format!("被控端断开：{}", b.reason)),
                     Some(other) => tracing::debug!("ignoring {other:?}"),
                     None => tracing::debug!("ignoring unknown control message"),
@@ -310,6 +343,16 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
                         break End::Lost(format!("control: {e}"));
                     }
                 }
+                Some(NetCmd::SendFiles(items)) => {
+                    if files_on {
+                        tokio::spawn(crate::files::upload(conn.clone(), items, sh.clone()));
+                    } else {
+                        sh.event(Event::Transfer {
+                            id: String::new(), upload: true, name: String::new(), done: 0, total: 0,
+                            finished: true, ok: false, message: "电脑上的被控端版本不支持文件传输，请升级被控端".into(),
+                        });
+                    }
+                }
                 Some(NetCmd::Quit) | None => {
                     let _ = write_msg(&mut send, &ctl(Msg::Bye(pb::Bye { reason: "用户断开".into() }))).await;
                     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -321,7 +364,8 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
                 let _ = write_msg(&mut send, &ctl(Msg::Ping(pb::Ping { t_us: nya_proto::now_us() }))).await;
             }
             _ = stats.tick() => {
-                let (line, client) = sh.stats.take(stats_at.elapsed().as_secs_f32());
+                let audio = sh.jitter.lock().unwrap().stats();
+                let (line, client) = sh.stats.take(stats_at.elapsed().as_secs_f32(), audio);
                 stats_at = Instant::now();
                 sh.event(Event::Stats(line));
                 let _ = write_msg(&mut send, &ctl(Msg::ClientStats(client))).await;
@@ -335,11 +379,18 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
     end
 }
 
-async fn accept_uni(conn: Connection, sh: Arc<Shared>, multi: bool) {
+async fn accept_uni(
+    conn: Connection,
+    sh: Arc<Shared>,
+    multi: bool,
+    downloads: Arc<crate::files::Downloads>,
+    download_dir: Option<std::path::PathBuf>,
+) {
     while let Ok(mut r) = conn.accept_uni().await {
-        let sh = sh.clone();
+        let (sh, downloads, download_dir) = (sh.clone(), downloads.clone(), download_dir.clone());
         tokio::spawn(async move {
             match read_varint(&mut r).await {
+                Ok(Some(stream_type::FILE)) => crate::files::receive(r, sh, downloads, download_dir).await,
                 Ok(Some(stream_type::VIDEO)) => {
                     let Ok(Some(stream_id)) = read_varint(&mut r).await else { return };
                     // With FEATURE_MULTI_STREAM the prelude names the window (slot).
@@ -422,7 +473,8 @@ mod tests {
     fn offers_only_what_android_implements() {
         let v = local_version();
         assert!(v.has(Feature::VirtualDisplay) && v.has(Feature::VideoDatagram) && v.has(Feature::Audio));
-        for f in [Feature::FileTransfer, Feature::UsbRedirect, Feature::FolderMount, Feature::Print, Feature::Hdr, Feature::Yuv444] {
+        assert!(v.has(Feature::TextInput) && v.has(Feature::FileTransfer) && v.has(Feature::Gamepad));
+        for f in [Feature::UsbRedirect, Feature::FolderMount, Feature::Print, Feature::Hdr, Feature::Yuv444, Feature::ClipboardFiles] {
             assert!(!v.has(f), "{f:?} must not be offered");
         }
         assert_eq!(v.major, nya_proto::PROTO_MAJOR);

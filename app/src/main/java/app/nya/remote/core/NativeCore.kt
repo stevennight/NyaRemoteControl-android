@@ -37,6 +37,27 @@ object NativeCore {
     @JvmStatic external fun key(handle: Long, scancode: Int, extended: Boolean, down: Boolean)
     @JvmStatic external fun releaseAll(handle: Long)
 
+    /** Text typed as Unicode on the host (only when the host offers text input). */
+    @JvmStatic external fun text(handle: Long, text: String)
+
+    /** XInput state of pad [index] (0..3): buttons are XINPUT_GAMEPAD_* bits, triggers 0..255, sticks -32768..32767. */
+    @JvmStatic external fun gamepad(
+        handle: Long, index: Int, connected: Boolean, buttons: Int,
+        leftTrigger: Int, rightTrigger: Int, lx: Int, ly: Int, rx: Int, ry: Int,
+    )
+
+    /** A decoded audio packet: [samples] 16-bit values, interleaved stereo. False if late / duplicate. */
+    @JvmStatic external fun audioPush(handle: Long, seq: Int, senderUs: Long, pcm: ShortArray, samples: Int): Boolean
+
+    /** Up to [maxFrames] frames of interleaved float stereo into [out]; returns frames written. */
+    @JvmStatic external fun audioPull(handle: Long, maxFrames: Int, deviceQueued: Int, out: FloatArray): Int
+
+    /** Download the files of a fileOffer event. */
+    @JvmStatic external fun requestFiles(handle: Long, offerId: String)
+
+    /** `[{"fd":..,"name":..,"size":..}]`; the core takes ownership of the (detached) descriptors. */
+    @JvmStatic external fun sendFiles(handle: Long, json: String)
+
     @JvmStatic external fun updateStream(handle: Long, streamJson: String)
     @JvmStatic external fun setMode(handle: Long, game: Boolean)
     @JvmStatic external fun sendSas(handle: Long)

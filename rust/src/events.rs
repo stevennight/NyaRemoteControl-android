@@ -17,6 +17,10 @@ pub enum Event {
         server_fingerprint: String,
         /// Short form for display.
         server_fingerprint_short: String,
+        /// The host types text as Unicode (protocol 1.5): the phone IME can be used as is.
+        text_input: bool,
+        file_transfer: bool,
+        gamepad: bool,
     },
     Reconnecting {
         message: String,
@@ -66,7 +70,45 @@ pub enum Event {
     Clipboard {
         text: String,
     },
+    /// The host copied files; `requestFiles(id)` downloads them.
+    FileOffer {
+        /// u64 as a string (JSON numbers lose precision above 2^53).
+        id: String,
+        files: Vec<OfferedFile>,
+        total_bytes: u64,
+    },
+    /// Progress of an upload or download; `finished` once it ends.
+    Transfer {
+        id: String,
+        upload: bool,
+        name: String,
+        done: u64,
+        total: u64,
+        finished: bool,
+        ok: bool,
+        message: String,
+    },
+    /// A whole download batch is in `download_dir`.
+    FilesReceived {
+        id: String,
+        paths: Vec<String>,
+    },
+    /// Force feedback for pad `index` (0..255 per motor).
+    Rumble {
+        index: u32,
+        large: u32,
+        small: u32,
+    },
     Stats(StatsLine),
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OfferedFile {
+    pub name: String,
+    pub path: String,
+    pub size: u64,
+    pub is_dir: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -96,6 +138,10 @@ pub struct StatsLine {
     pub fec_percent: u32,
     pub frames_lost: u32,
     pub frames_dropped: u32,
+    /// Audio jitter buffer: current depth and target (ms), underruns so far.
+    pub audio_ms: f32,
+    pub audio_target_ms: f32,
+    pub audio_underruns: u32,
 }
 
 pub fn codec_name(c: i32) -> &'static str {

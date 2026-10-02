@@ -511,6 +511,7 @@ dependencies = [
  "base64",
  "crossbeam-channel",
  "jni",
+ "nya-jitter",
  "nya-proto",
  "nya-transport",
  "serde",
@@ -519,6 +520,10 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
 ]
+
+[[package]]
+name = "nya-jitter"
+version = "0.1.0"
 
 [[package]]
 name = "nya-proto"

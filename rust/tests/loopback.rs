@@ -1,6 +1,6 @@
 //! The core against a fake host on loopback: real QUIC, handshake, pairing,
-//! stream request, a video frame through the gate, and a keyframe request
-//! after a gap. Runs on the development machine (no phone needed).
+//! stream request, a video frame through the gate, a keyframe request after
+//! a gap, text input, and files both ways. Runs on the development machine (no phone needed).
 
 use std::time::{Duration, Instant};
 
@@ -8,9 +8,10 @@ use nya_android::events::Event;
 use nya_android::options::{StartConfig, StreamOptions, VirtualScreen};
 use nya_android::session::{Next, Session};
 use nya_proto::frame::{frame_flags, stream_type, VideoFrameHeader};
-use nya_proto::framing::{encode_varint, expect_msg, read_msg, write_msg};
+use nya_proto::framing::{encode_varint, expect_msg, read_msg, read_varint, write_msg};
+use nya_transport::files;
 use nya_proto::negotiate::{self, LocalVersion};
-use nya_proto::pb::{self, control_msg::Msg};
+use nya_proto::pb::{self, control_msg::Msg, input_msg::Ev};
 use nya_proto::MAX_MESSAGE_LEN;
 use nya_transport::identity::peer_fingerprint;
 use nya_transport::pairing::{self, PairingKey, Transcript};
@@ -42,6 +43,8 @@ fn frame(id: u64, key: bool, payload: &[u8]) -> Vec<u8> {
 struct Seen {
     start: pb::StartStream,
     keyframe_requested: bool,
+    text: String,
+    upload: Option<(String, Vec<u8>)>,
 }
 
 async fn fake_host(endpoint: nya_transport::quinn::Endpoint, id: Identity, key: PairingKey) -> Seen {
@@ -88,31 +91,87 @@ async fn fake_host(endpoint: nya_transport::quinn::Endpoint, id: Identity, key: 
     v.write_all(&frame(1, true, b"\0\0\0\x01key")).await.unwrap();
     v.write_all(&frame(3, false, b"\0\0\0\x01late")).await.unwrap();
 
-    let mut keyframe_requested = false;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        match tokio::time::timeout(Duration::from_secs(5), read_msg::<pb::ControlMsg, _>(&mut recv, MAX_MESSAGE_LEN)).await {
-            Ok(Ok(Some(m))) => match m.msg {
-                Some(Msg::RequestKeyframe(_)) => {
-                    keyframe_requested = true;
-                    break;
-                }
-                Some(Msg::Ping(p)) => {
-                    let pong = pb::Pong { t_us: p.t_us, server_t_us: nya_proto::now_us() };
-                    write_msg(&mut send, &ctl(Msg::Pong(pong))).await.unwrap();
-                }
-                _ => {}
+    // The client's input stream and uploads.
+    let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel::<Uploaded>();
+    let streams = {
+        let conn = conn.clone();
+        tokio::spawn(async move {
+            while let Ok(mut r) = conn.accept_uni().await {
+                let up_tx = up_tx.clone();
+                tokio::spawn(async move {
+                    match read_varint(&mut r).await {
+                        Ok(Some(stream_type::INPUT)) => {
+                            while let Ok(Some(m)) = read_msg::<pb::InputMsg, _>(&mut r, MAX_MESSAGE_LEN).await {
+                                if let Some(Ev::Text(t)) = m.ev {
+                                    let _ = up_tx.send(Uploaded::Text(t.text));
+                                }
+                            }
+                        }
+                        Ok(Some(stream_type::FILE)) => {
+                            let h = files::read_header(&mut r).await.unwrap();
+                            let data = files::receive_to_vec(&mut r, &h, 1 << 20).await.unwrap();
+                            let _ = up_tx.send(Uploaded::File(h, data));
+                        }
+                        _ => {}
+                    }
+                });
+            }
+        })
+    };
+
+    // Files copied on the host.
+    let offer = pb::FileOffer {
+        transfer_id: u64::MAX - 5, // above 2^53: must survive JSON as a string
+        files: vec![pb::FileEntry { name: "host.txt".into(), size: 5, path: "host.txt".into(), is_dir: false }],
+    };
+    write_msg(&mut send, &ctl(Msg::FileOffer(offer.clone()))).await.unwrap();
+
+    let mut seen = Seen { start, keyframe_requested: false, text: String::new(), upload: None };
+    loop {
+        tokio::select! {
+            m = read_msg::<pb::ControlMsg, _>(&mut recv, MAX_MESSAGE_LEN) => match m {
+                Ok(Some(m)) => match m.msg {
+                    Some(Msg::RequestKeyframe(_)) => seen.keyframe_requested = true,
+                    Some(Msg::Ping(p)) => {
+                        let pong = pb::Pong { t_us: p.t_us, server_t_us: nya_proto::now_us() };
+                        write_msg(&mut send, &ctl(Msg::Pong(pong))).await.unwrap();
+                    }
+                    Some(Msg::FileRequest(r)) => {
+                        assert_eq!(r.transfer_id, offer.transfer_id);
+                        assert_eq!(r.purpose, pb::FilePurpose::Save as i32);
+                        let h = pb::FileHeader {
+                            transfer_id: r.transfer_id,
+                            name: "host.txt".into(),
+                            size: 5,
+                            purpose: pb::FilePurpose::Save as i32,
+                            index: 0,
+                            count: 1,
+                            path: String::new(),
+                        };
+                        files::send_bytes(&conn, h, b"hello").await.unwrap();
+                    }
+                    Some(Msg::Bye(_)) => break,
+                    _ => {}
+                },
+                _ => break,
             },
-            _ => break,
+            Some(u) = up_rx.recv() => match u {
+                Uploaded::Text(t) => seen.text.push_str(&t),
+                Uploaded::File(h, data) => {
+                    let ok = pb::FileResult { transfer_id: h.transfer_id, ok: true, message: "已保存 1 个文件".into(), saved_to: "C:/Downloads".into() };
+                    write_msg(&mut send, &ctl(Msg::FileResult(ok))).await.unwrap();
+                    seen.upload = Some((h.name, data));
+                }
+            },
         }
     }
-    // Wait for the client's goodbye.
-    while let Ok(Some(m)) = read_msg::<pb::ControlMsg, _>(&mut recv, MAX_MESSAGE_LEN).await {
-        if matches!(m.msg, Some(Msg::Bye(_))) {
-            break;
-        }
-    }
-    Seen { start, keyframe_requested }
+    streams.abort();
+    seen
+}
+
+enum Uploaded {
+    Text(String),
+    File(pb::FileHeader, Vec<u8>),
 }
 
 fn wait_event(s: &Session, want: impl Fn(&Event) -> bool) -> Event {
@@ -155,6 +214,7 @@ fn pairs_streams_and_resyncs_on_gaps() {
             virtual_screen: Some(VirtualScreen { width: 2400, height: 1080, refresh_hz: 60, scale_percent: 150 }),
             ..Default::default()
         },
+        download_dir: Some(dir.join("received").to_string_lossy().into_owned()),
     };
     let session = Session::start(&dir, cfg).unwrap();
 
@@ -173,10 +233,32 @@ fn pairs_streams_and_resyncs_on_gaps() {
     // The frame after the gap never reaches the decoder.
     assert!(matches!(session.next_video(Duration::from_millis(500)), Next::Timeout));
 
+    // Text, as the phone keyboard would send it.
+    session.input(Ev::Text(pb::TextInput { text: "你好 nya".into() }));
+
+    // The host's offer arrives; download it.
+    let Event::FileOffer { id, files, total_bytes } = wait_event(&session, |e| matches!(e, Event::FileOffer { .. })) else { unreachable!() };
+    assert_eq!(id, (u64::MAX - 5).to_string());
+    assert_eq!((files.len(), total_bytes), (1, 5));
+    session.control(Msg::FileRequest(pb::FileRequest { transfer_id: id.parse().unwrap(), purpose: pb::FilePurpose::Save as i32 }));
+    let Event::FilesReceived { paths, .. } = wait_event(&session, |e| matches!(e, Event::FilesReceived { .. })) else { unreachable!() };
+    assert_eq!(std::fs::read(&paths[0]).unwrap(), b"hello");
+
+    // Upload a file the "app" opened.
+    let src = dir.join("phone.txt");
+    std::fs::write(&src, b"from the phone").unwrap();
+    let file = std::fs::File::open(&src).unwrap();
+    session.send_files(vec![nya_android::files::Upload { file, name: "phone.txt".into(), size: 14 }]);
+    let done = wait_event(&session, |e| matches!(e, Event::Transfer { finished: true, upload: true, .. }));
+    let Event::Transfer { ok, message, .. } = done else { unreachable!() };
+    assert!(ok, "{message}");
+
     session.stop();
     wait_event(&session, |e| matches!(e, Event::Disconnected { .. }));
     let seen = rt.block_on(host).unwrap();
     assert!(seen.keyframe_requested, "a gap asks the host for a keyframe");
+    assert_eq!(seen.text, "你好 nya");
+    assert_eq!(seen.upload, Some(("phone.txt".to_string(), b"from the phone".to_vec())));
     let vs = &seen.start.display_setup.unwrap().virtual_screens[0];
     assert_eq!((vs.width, vs.height, vs.scale_percent), (2400, 1080, 150));
     drop(session);

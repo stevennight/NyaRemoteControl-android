@@ -23,6 +23,9 @@ pub struct StartConfig {
     #[serde(default)]
     pub max_fps: u32,
     pub stream: StreamOptions,
+    /// Where files from the host are received (the app then moves them to Downloads).
+    #[serde(default)]
+    pub download_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

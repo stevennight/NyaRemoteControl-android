@@ -14,8 +14,13 @@ import androidx.compose.runtime.setValue
 /**
  * Keys to the host, with sticky modifiers from the extra-keys bar: tap Ctrl,
  * then C, and the host gets Ctrl+C.
+ *
+ * Typed text goes as Unicode ([sendText]) when the host supports it (protocol
+ * 1.5), so any phone keyboard and language works; otherwise as US-layout keys.
  */
-class KeyboardController(private val send: (ScanKey, Boolean) -> Unit) {
+class KeyboardController(private val send: (ScanKey, Boolean) -> Unit, private val sendText: (String) -> Unit = {}) {
+    /** The host types Unicode text (TEXT_INPUT negotiated). */
+    var textInput = false
     /** Modifiers latched for the next key. */
     var sticky by mutableStateOf(emptySet<ScanKey>())
         private set
@@ -45,6 +50,24 @@ class KeyboardController(private val send: (ScanKey, Boolean) -> Unit) {
     }
 
     fun type(text: CharSequence) {
+        if (textInput && sticky.isEmpty()) {
+            // Line breaks and tabs are keys to applications; the rest is text.
+            val run = StringBuilder()
+            fun flush() {
+                if (run.isNotEmpty()) sendText(run.toString())
+                run.clear()
+            }
+            for (c in text) {
+                when (c) {
+                    '\n' -> { flush(); tap(KeyMap.ENTER) }
+                    '\t' -> { flush(); tap(KeyMap.TAB) }
+                    '\r' -> {}
+                    else -> run.append(c)
+                }
+            }
+            flush()
+            return
+        }
         for (c in text) {
             val s = KeyMap.stroke(c)
             if (s == null) onUntypable?.invoke(c) else tap(s.key, s.shift)
@@ -71,8 +94,13 @@ class RemoteKeyboardView(context: Context, private val keys: KeyboardController)
     override fun onCheckIsTextEditor() = true
 
     override fun onCreateInputConnection(outAttrs: EditorInfo): InputConnection {
-        outAttrs.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD or
-            InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+        // With Unicode text the phone's own keyboard and IME (Chinese, suggestions) work as usual;
+        // without it, a plain keyboard sends keys one by one.
+        outAttrs.inputType = if (keys.textInput) {
+            InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+        } else {
+            InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+        }
         outAttrs.imeOptions = EditorInfo.IME_FLAG_NO_EXTRACT_UI or EditorInfo.IME_FLAG_NO_FULLSCREEN or
             EditorInfo.IME_ACTION_NONE
         return Connection()
@@ -81,21 +109,28 @@ class RemoteKeyboardView(context: Context, private val keys: KeyboardController)
     private inner class Connection : BaseInputConnection(this, false) {
         private var composing = ""
 
-        override fun commitText(text: CharSequence, newCursorPosition: Int): Boolean {
-            replaceComposing("")
-            keys.type(text)
-            return true
-        }
-
-        // IMEs that compose anyway (e.g. word suggestions): mirror the
-        // composition on the host with backspaces, so only final text stays.
+        // Text mode: the composition (pinyin, a word being typed) stays in the
+        // IME and only the result is sent. Key mode: IMEs that compose anyway
+        // are mirrored on the host with backspaces, so only final text stays.
         override fun setComposingText(text: CharSequence, newCursorPosition: Int): Boolean {
-            replaceComposing(text.toString())
+            if (keys.textInput) composing = text.toString() else replaceComposing(text.toString())
             return true
         }
 
         override fun finishComposingText(): Boolean {
+            if (keys.textInput && composing.isNotEmpty()) keys.type(composing)
             composing = ""
+            return true
+        }
+
+        override fun commitText(text: CharSequence, newCursorPosition: Int): Boolean {
+            if (keys.textInput) {
+                composing = ""
+                keys.type(text)
+            } else {
+                replaceComposing("")
+                keys.type(text)
+            }
             return true
         }
 

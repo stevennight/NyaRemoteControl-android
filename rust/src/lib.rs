@@ -10,6 +10,7 @@
 //! * [`options`] / [`events`] – JSON in and out
 
 pub mod events;
+pub mod files;
 pub mod gate;
 mod logcat;
 pub mod net;
@@ -20,7 +21,7 @@ pub mod stats;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use jni::objects::{JByteBuffer, JClass, JLongArray, JString};
+use jni::objects::{JByteBuffer, JClass, JFloatArray, JLongArray, JShortArray, JString};
 use jni::sys::{jboolean, jfloat, jint, jlong, jstring, JNI_TRUE};
 use jni::JNIEnv;
 use nya_proto::pb::{self, control_msg::Msg, input_msg::Ev};
@@ -292,6 +293,137 @@ pub extern "system" fn Java_app_nya_remote_core_NativeCore_setDecodeStats(
     if let Some(s) = session(h) {
         s.shared.stats.set_decode(decode_ms, dropped.max(0) as u32);
     }
+}
+
+/// Text typed on the phone (FEATURE_TEXT_INPUT): the host types it as Unicode.
+#[no_mangle]
+pub extern "system" fn Java_app_nya_remote_core_NativeCore_text<'l>(mut env: JNIEnv<'l>, _cls: JClass<'l>, h: jlong, text: JString<'l>) {
+    let text = string(&mut env, &text).unwrap_or_default();
+    if let Some(s) = session(h) {
+        if !text.is_empty() {
+            s.input(Ev::Text(pb::TextInput { text }));
+        }
+    }
+}
+
+/// XInput state of pad `index` (0..3); see pb::Gamepad.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_app_nya_remote_core_NativeCore_gamepad(
+    _env: JNIEnv,
+    _cls: JClass,
+    h: jlong,
+    index: jint,
+    connected: jboolean,
+    buttons: jint,
+    left_trigger: jint,
+    right_trigger: jint,
+    lx: jint,
+    ly: jint,
+    rx: jint,
+    ry: jint,
+) {
+    if let Some(s) = session(h) {
+        s.input(Ev::Gamepad(pb::Gamepad {
+            index: index.clamp(0, 3) as u32,
+            connected: connected == JNI_TRUE,
+            buttons: buttons as u32 & 0xffff,
+            left_trigger: left_trigger.clamp(0, 255) as u32,
+            right_trigger: right_trigger.clamp(0, 255) as u32,
+            lx: lx.clamp(-32768, 32767),
+            ly: ly.clamp(-32768, 32767),
+            rx: rx.clamp(-32768, 32767),
+            ry: ry.clamp(-32768, 32767),
+        }));
+    }
+}
+
+/// A decoded audio packet: `samples` 16-bit values of interleaved stereo.
+#[no_mangle]
+pub extern "system" fn Java_app_nya_remote_core_NativeCore_audioPush<'l>(
+    env: JNIEnv<'l>,
+    _cls: JClass<'l>,
+    h: jlong,
+    seq: jint,
+    sender_us: jlong,
+    pcm: JShortArray<'l>,
+    samples: jint,
+) -> jboolean {
+    let Some(s) = session(h) else { return 0 };
+    let mut buf = vec![0i16; samples.max(0) as usize & !1];
+    if env.get_short_array_region(&pcm, 0, &mut buf).is_err() {
+        return 0;
+    }
+    s.audio_push(seq as u32, sender_us as u64, &buf) as jboolean
+}
+
+/// Up to `max_frames` frames of interleaved f32 stereo into `out`; returns the frames written.
+#[no_mangle]
+pub extern "system" fn Java_app_nya_remote_core_NativeCore_audioPull<'l>(
+    env: JNIEnv<'l>,
+    _cls: JClass<'l>,
+    h: jlong,
+    max_frames: jint,
+    device_queued: jint,
+    out: JFloatArray<'l>,
+) -> jint {
+    let Some(s) = session(h) else { return 0 };
+    let cap = env.get_array_length(&out).unwrap_or(0).max(0) as usize / 2;
+    let mut buf = Vec::with_capacity(cap * 2);
+    let n = s.audio_pull((max_frames.max(0) as usize).min(cap), device_queued.max(0) as usize, &mut buf);
+    if n > 0 && env.set_float_array_region(&out, 0, &buf[..n * 2]).is_err() {
+        return 0;
+    }
+    n as jint
+}
+
+/// Download the files of a FileOffer (id as given in the event).
+#[no_mangle]
+pub extern "system" fn Java_app_nya_remote_core_NativeCore_requestFiles<'l>(mut env: JNIEnv<'l>, _cls: JClass<'l>, h: jlong, id: JString<'l>) {
+    let Some(id) = string(&mut env, &id).and_then(|i| i.parse::<u64>().ok()) else { return };
+    if let Some(s) = session(h) {
+        s.control(Msg::FileRequest(pb::FileRequest { transfer_id: id, purpose: pb::FilePurpose::Save as i32 }));
+    }
+}
+
+/// Send files to the host. `json`: `[{"fd": 42, "name": "a.jpg", "size": 123}]`;
+/// the core takes ownership of the file descriptors (detached by the app).
+#[no_mangle]
+pub extern "system" fn Java_app_nya_remote_core_NativeCore_sendFiles<'l>(mut env: JNIEnv<'l>, _cls: JClass<'l>, h: jlong, json: JString<'l>) {
+    #[derive(serde::Deserialize)]
+    struct Picked {
+        fd: i32,
+        name: String,
+        size: u64,
+    }
+    let json = string(&mut env, &json).unwrap_or_default();
+    let picked: Vec<Picked> = match serde_json::from_str(&json) {
+        Ok(p) => p,
+        Err(e) => return tracing::warn!("sendFiles: {e}"),
+    };
+    let items: Vec<files::Upload> = picked
+        .into_iter()
+        .filter_map(|p| {
+            let file = file_from_fd(p.fd)?;
+            Some(files::Upload { file, name: nya_transport::files::sanitize_name(&p.name), size: p.size })
+        })
+        .collect();
+    match session(h) {
+        Some(s) if !items.is_empty() => s.send_files(items),
+        _ => {}
+    }
+}
+
+#[cfg(unix)]
+fn file_from_fd(fd: i32) -> Option<std::fs::File> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: the app detached this descriptor for us; we own and close it.
+    (fd >= 0).then(|| unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+#[cfg(not(unix))]
+fn file_from_fd(_fd: i32) -> Option<std::fs::File> {
+    None
 }
 
 /// Disconnect; a Disconnected event follows.

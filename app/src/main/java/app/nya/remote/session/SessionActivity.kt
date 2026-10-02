@@ -21,6 +21,14 @@ import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.view.inputmethod.InputMethodManager
+import android.hardware.input.InputManager
+import androidx.activity.result.contract.ActivityResultContracts
+import app.nya.remote.data.Downloads
+import app.nya.remote.input.Gamepads
+import kotlinx.serialization.json.add
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import android.widget.FrameLayout
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -74,6 +82,14 @@ class SessionActivity : ComponentActivity(), SessionActions {
     private var surfaceReady = false
     private var guideShown = false
     private var untypableHinted = false
+    private lateinit var gamepads: Gamepads
+    private val inputManager by lazy { getSystemService(Context.INPUT_SERVICE) as InputManager }
+    private val padListener = object : InputManager.InputDeviceListener {
+        override fun onInputDeviceAdded(deviceId: Int) {}
+        override fun onInputDeviceChanged(deviceId: Int) {}
+        override fun onInputDeviceRemoved(deviceId: Int) = gamepads.removed(deviceId)
+    }
+    private val filePicker = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris -> sendPicked(uris) }
     private val main = Handler(Looper.getMainLooper())
     private val longPress = Runnable { gestures.timeout(SystemClock.uptimeMillis()); scheduleLongPress() }
 
@@ -103,7 +119,15 @@ class SessionActivity : ComponentActivity(), SessionActions {
             systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         }
 
-        keys = KeyboardController { k, down -> session?.key(k.code, k.extended, down) }
+        keys = KeyboardController(
+            send = { k, down -> session?.key(k.code, k.extended, down) },
+            sendText = { session?.text(it) },
+        )
+        gamepads = Gamepads { i, connected, st ->
+            session?.gamepad(i, connected, st.buttons, st.leftTrigger, st.rightTrigger, st.lx, st.ly, st.rx, st.ry)
+        }
+        gamepads.onFirstPad = { name -> Toast.makeText(this, "手柄已连接：$name（电脑上是虚拟 Xbox 手柄）", Toast.LENGTH_SHORT).show() }
+        inputManager.registerInputDeviceListener(padListener, main)
         keys.onUntypable = {
             if (!untypableHinted) {
                 untypableHinted = true
@@ -213,6 +237,7 @@ class SessionActivity : ComponentActivity(), SessionActions {
             decoders = decoders.map { it.cap() },
             maxFps = minOf(refreshRate(), s.maxFps),
             stream = currentStreamOptions(),
+            downloadDir = Downloads.receiveDir(this).absolutePath,
         )
         pairCode = null
         ui.status = Status.Connecting
@@ -234,6 +259,13 @@ class SessionActivity : ComponentActivity(), SessionActions {
             is CoreEvent.Connected -> {
                 ui.status = Status.Connected
                 ui.needPairing = false
+                ui.fileTransfer = e.fileTransfer
+                ui.gamepad = e.gamepad
+                if (keys.textInput != e.textInput) {
+                    keys.textInput = e.textInput
+                    // The keyboard type depends on it (phone IME with Unicode text, plain keys otherwise).
+                    (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager).restartInput(keyboardView)
+                }
                 host = host.copy(
                     fingerprint = e.fingerprint,
                     fingerprintShort = e.fingerprintShort,
@@ -269,6 +301,10 @@ class SessionActivity : ComponentActivity(), SessionActions {
                 cm.setPrimaryClip(ClipData.newPlainText("NyaRemoteControl", e.text))
             }
             is CoreEvent.Stats -> ui.stats = e.line
+            is CoreEvent.FileOffer -> ui.offer = e
+            is CoreEvent.Transfer -> onTransfer(e)
+            is CoreEvent.FilesReceived -> saveReceived(e)
+            is CoreEvent.Rumble -> gamepads.rumble(e.index, e.large, e.small) { InputDevice.getDevice(it) }
         }
     }
 
@@ -288,7 +324,58 @@ class SessionActivity : ComponentActivity(), SessionActions {
         decoder = null
     }
 
+    private fun onTransfer(e: CoreEvent.Transfer) {
+        ui.transfer = e
+        if (e.finished) {
+            if (!e.ok || e.upload) Toast.makeText(this, e.message, Toast.LENGTH_LONG).show()
+            main.postDelayed({ if (ui.transfer === e) ui.transfer = null }, 3000)
+        }
+    }
+
+    private fun saveReceived(e: CoreEvent.FilesReceived) {
+        val files = e.paths.map { java.io.File(it) }
+        thread(name = "nya-save") {
+            val msg = try {
+                "已保存 ${files.size} 个文件到 ${Downloads.saveAll(this, files)}"
+            } catch (ex: Exception) {
+                "保存文件失败：${ex.message}"
+            }
+            main.post { Toast.makeText(this, msg, Toast.LENGTH_LONG).show() }
+        }
+    }
+
+    /** Files picked on the phone: open them here, the core sends them. */
+    private fun sendPicked(uris: List<android.net.Uri>) {
+        if (uris.isEmpty()) return
+        val picked = buildJsonArray {
+            for (uri in uris) {
+                val (name, size) = Downloads.describe(this@SessionActivity, uri) ?: continue
+                val pfd = try {
+                    contentResolver.openFileDescriptor(uri, "r")
+                } catch (_: Exception) {
+                    null
+                } ?: continue
+                val len = if (size >= 0) size else pfd.statSize
+                if (len < 0) {
+                    pfd.close()
+                    continue
+                }
+                add(buildJsonObject {
+                    put("fd", pfd.detachFd())
+                    put("name", name)
+                    put("size", len)
+                })
+            }
+        }
+        if (picked.isEmpty()) {
+            Toast.makeText(this, "无法读取选中的文件", Toast.LENGTH_SHORT).show()
+            return
+        }
+        session?.sendFiles(picked.toString())
+    }
+
     private fun closeSession() {
+        if (::gamepads.isInitialized) gamepads.clear()
         stopDecoder()
         audio?.stop()
         audio = null
@@ -299,6 +386,7 @@ class SessionActivity : ComponentActivity(), SessionActions {
 
     override fun onDestroy() {
         main.removeCallbacksAndMessages(null)
+        if (::gamepads.isInitialized) inputManager.unregisterInputDeviceListener(padListener)
         if (::ui.isInitialized) closeSession()
         super.onDestroy()
     }
@@ -380,10 +468,14 @@ class SessionActivity : ComponentActivity(), SessionActions {
 
     // Hardware keyboards; the soft keyboard goes through RemoteKeyboardView's input connection.
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean =
-        (fromKeyboard(event) && keys.key(keyCode, true)) || super.onKeyDown(keyCode, event)
+        (ui.gamepad && gamepads.onKey(event)) || (fromKeyboard(event) && keys.key(keyCode, true)) || super.onKeyDown(keyCode, event)
 
     override fun onKeyUp(keyCode: Int, event: KeyEvent): Boolean =
-        (fromKeyboard(event) && keys.key(keyCode, false)) || super.onKeyUp(keyCode, event)
+        (ui.gamepad && gamepads.onKey(event)) || (fromKeyboard(event) && keys.key(keyCode, false)) || super.onKeyUp(keyCode, event)
+
+    // Controller sticks and triggers (pointer events are handled by the layout).
+    override fun onGenericMotionEvent(event: MotionEvent): Boolean =
+        (ui.gamepad && gamepads.onMotion(event)) || super.onGenericMotionEvent(event)
 
     private fun fromKeyboard(event: KeyEvent) =
         event.device?.isVirtual == false && event.source and InputDevice.SOURCE_KEYBOARD == InputDevice.SOURCE_KEYBOARD
@@ -485,6 +577,21 @@ class SessionActivity : ComponentActivity(), SessionActions {
     override fun retry() {
         closeSession()
         connect()
+    }
+
+    override fun pickFiles() {
+        ui.panelOpen = false
+        filePicker.launch(arrayOf("*/*"))
+    }
+
+    override fun acceptOffer() {
+        val o = ui.offer ?: return
+        ui.offer = null
+        session?.requestFiles(o.id)
+    }
+
+    override fun dismissOffer() {
+        ui.offer = null
     }
 
     override fun disconnect() {

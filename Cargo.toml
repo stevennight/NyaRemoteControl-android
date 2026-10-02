@@ -18,6 +18,7 @@ crate-type = ["cdylib", "rlib"]
 # (CI does the same; a release pins the commit in COMMON_REF).
 nya-proto = { path = "../common/crates/nya-proto" }
 nya-transport = { path = "../common/crates/nya-transport" }
+nya-jitter = { path = "../common/crates/nya-jitter" }
 
 anyhow = "1"
 tracing = "0.1"

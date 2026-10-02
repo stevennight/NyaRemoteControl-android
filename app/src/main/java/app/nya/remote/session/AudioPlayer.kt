@@ -11,10 +11,10 @@ import java.nio.ByteOrder
 import kotlin.concurrent.thread
 
 /**
- * Host audio: Opus datagrams (48 kHz stereo) decoded by MediaCodec, played by
- * a low-latency AudioTrack. Keeps the device queue short: when more than
- * [MAX_QUEUED_MS] is waiting (a burst after a network stall), audio is dropped
- * rather than played late. Lost packets are not concealed.
+ * Host audio: Opus datagrams (48 kHz stereo) decoded by MediaCodec, then the
+ * core's adaptive jitter buffer (the same one as the Windows client: 20–80 ms
+ * depth following the measured jitter, clock drift absorbed by ±0.5 % speed,
+ * short losses filled with silence) feeds a low-latency float AudioTrack.
  */
 class AudioPlayer(private val session: RemoteSession) {
     @Volatile
@@ -57,7 +57,7 @@ class AudioPlayer(private val session: RemoteSession) {
         codec.configure(format, null, null, 0)
         codec.start()
 
-        val minBuf = AudioTrack.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_OUT_STEREO, AudioFormat.ENCODING_PCM_16BIT)
+        val minBuf = AudioTrack.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_OUT_STEREO, AudioFormat.ENCODING_PCM_FLOAT)
         val track = AudioTrack.Builder()
             .setAudioAttributes(
                 AudioAttributes.Builder()
@@ -69,51 +69,67 @@ class AudioPlayer(private val session: RemoteSession) {
                 AudioFormat.Builder()
                     .setSampleRate(SAMPLE_RATE)
                     .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
-                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .setEncoding(AudioFormat.ENCODING_PCM_FLOAT)
                     .build(),
             )
-            .setBufferSizeInBytes(maxOf(minBuf, BYTES_PER_MS * 2 * MAX_QUEUED_MS))
+            .setBufferSizeInBytes(maxOf(minBuf, FRAMES_PER_MS * DEVICE_TARGET_MS * 3 * CHANNELS * 4))
             .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
             .setTransferMode(AudioTrack.MODE_STREAM)
             .build()
         track.play()
 
-        val packet = ByteBuffer.allocateDirect(4096)
+        val packet = ByteBuffer.allocateDirect(4096).order(ByteOrder.LITTLE_ENDIAN)
         val info = MediaCodec.BufferInfo()
-        var pcm = ByteArray(0)
-        var written = 0L // frames
-        var pts = 0L
+        // Packets in the decoder: presentation time (= sender time) -> sequence number.
+        val inFlight = LinkedHashMap<Long, Int>()
+        var pcm = ShortArray(0)
+        val out = FloatArray(FRAMES_PER_MS * DEVICE_TARGET_MS * 2 * CHANNELS)
+        var written = 0L // frames handed to the track
         try {
             while (running) {
-                val n = session.nextAudio(packet, 100)
+                val n = session.nextAudio(packet, POLL_MS)
                 if (n == -1) break
                 if (n > HEADER) {
+                    val seq = packet.getInt(1)
+                    val ts = packet.getLong(5)
                     val idx = codec.dequeueInputBuffer(5_000)
                     if (idx >= 0) {
                         val ib = codec.getInputBuffer(idx)!!
                         ib.clear()
                         packet.position(HEADER).limit(n)
                         ib.put(packet)
-                        packet.clear()
-                        codec.queueInputBuffer(idx, 0, n - HEADER, pts, 0)
-                        pts += 10_000
+                        codec.queueInputBuffer(idx, 0, n - HEADER, ts, 0)
+                        inFlight[ts] = seq
+                        if (inFlight.size > 64) inFlight.clear()
                     }
+                    packet.clear()
                 }
+                // Decoded packets go into the jitter buffer.
                 while (true) {
                     val o = codec.dequeueOutputBuffer(info, 0)
                     if (o < 0) break
                     val ob = codec.getOutputBuffer(o)
-                    if (ob != null && info.size > 0) {
-                        val queued = written - track.playbackHeadPosition.toLong()
-                        if (queued * 1000 / SAMPLE_RATE <= MAX_QUEUED_MS) {
-                            if (pcm.size < info.size) pcm = ByteArray(info.size)
-                            ob.position(info.offset)
-                            ob.get(pcm, 0, info.size)
-                            val w = track.write(pcm, 0, info.size, AudioTrack.WRITE_NON_BLOCKING)
-                            if (w > 0) written += w / (2 * CHANNELS)
-                        }
+                    // Decoders that rewrite timestamps: outputs come in input order.
+                    val seq = inFlight.remove(info.presentationTimeUs)
+                        ?: inFlight.keys.firstOrNull()?.let { inFlight.remove(it) }
+                    if (ob != null && info.size > 0 && seq != null) {
+                        val samples = info.size / 2
+                        if (pcm.size < samples) pcm = ShortArray(samples)
+                        ob.position(info.offset)
+                        ob.order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(pcm, 0, samples)
+                        session.audioPush(seq, info.presentationTimeUs, pcm, samples)
                     }
                     codec.releaseOutputBuffer(o, false)
+                }
+                // Keep about DEVICE_TARGET_MS in the device; the jitter buffer decides what that is.
+                val queued = (written - (track.playbackHeadPosition.toLong() and 0xffffffffL)).coerceAtLeast(0).toInt()
+                val want = FRAMES_PER_MS * DEVICE_TARGET_MS - queued
+                if (want > 0) {
+                    val frames = session.audioPull(want, queued, out)
+                    if (frames > 0) {
+                        val w = track.write(out, 0, frames * CHANNELS, AudioTrack.WRITE_NON_BLOCKING)
+                        if (w > 0) written += w / CHANNELS
+                    }
                 }
             }
         } finally {
@@ -134,10 +150,13 @@ class AudioPlayer(private val session: RemoteSession) {
         const val TAG = "NyaAudio"
         const val SAMPLE_RATE = 48_000
         const val CHANNELS = 2
-        const val BYTES_PER_MS = SAMPLE_RATE / 1000 * CHANNELS * 2
+        const val FRAMES_PER_MS = SAMPLE_RATE / 1000
 
         /** `u8 type, u32 seq, u64 capture_ts` before the Opus packet. */
         const val HEADER = 13
-        const val MAX_QUEUED_MS = 120
+
+        /** What the device should hold (as on Windows). */
+        const val DEVICE_TARGET_MS = 20
+        const val POLL_MS = 3
     }
 }

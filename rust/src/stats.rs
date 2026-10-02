@@ -80,7 +80,7 @@ impl Stats {
     }
 
     /// The last second's numbers (resets the counters).
-    pub fn take(&self, secs: f32) -> (StatsLine, pb::ClientStats) {
+    pub fn take(&self, secs: f32, audio: nya_jitter::JitterStats) -> (StatsLine, pb::ClientStats) {
         let mut s = self.0.lock().unwrap();
         let secs = secs.max(0.001);
         let server = s.server.clone().unwrap_or_default();
@@ -96,6 +96,9 @@ impl Stats {
             fec_percent: server.fec_percent,
             frames_lost: s.dgram.frames_lost,
             frames_dropped: s.dropped,
+            audio_ms: audio.level_ms,
+            audio_target_ms: audio.target_ms,
+            audio_underruns: audio.underruns,
         };
         let client = pb::ClientStats {
             decode_ms_p50: s.decode_ms,

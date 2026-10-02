@@ -17,10 +17,12 @@ use crate::events::Event;
 use crate::gate::{Admit, Gate};
 use crate::options::StartConfig;
 use crate::stats::Stats;
+use nya_jitter::JitterBuffer;
 
 pub enum NetCmd {
     Input(pb::InputMsg),
     Control(pb::ControlMsg),
+    SendFiles(Vec<crate::files::Upload>),
     Quit,
 }
 
@@ -55,6 +57,10 @@ pub struct Shared {
     pub stats: Stats,
     pub cmds: mpsc::UnboundedSender<NetCmd>,
     pair_reply: Mutex<Option<std::sync::mpsc::Sender<Option<String>>>>,
+    /// Host audio after decoding (the app decodes Opus with MediaCodec).
+    pub jitter: Mutex<JitterBuffer>,
+    /// Local clock for the jitter buffer.
+    epoch: Instant,
 }
 
 impl Shared {
@@ -111,6 +117,10 @@ impl Shared {
         self.gate.lock().unwrap().reset();
     }
 
+    pub fn now_us(&self) -> u64 {
+        self.epoch.elapsed().as_micros() as u64
+    }
+
     /// Ask Kotlin for the pairing code and wait for it (blocking).
     pub fn ask_pair_code(&self) -> Option<String> {
         let (tx, rx) = std::sync::mpsc::channel();
@@ -165,6 +175,8 @@ impl Session {
             stats: Stats::default(),
             cmds: cmds_tx,
             pair_reply: Mutex::new(None),
+            jitter: Mutex::new(JitterBuffer::new()),
+            epoch: Instant::now(),
         });
         runtime.spawn(crate::net::main(cfg, identity, shared.clone(), cmds_rx));
         Ok(Self { shared, events, video, video_pending: Mutex::new(None), audio, runtime: Mutex::new(Some(runtime)) })
@@ -193,6 +205,25 @@ impl Session {
         if let Some(tx) = self.shared.pair_reply.lock().unwrap().take() {
             let _ = tx.send(code);
         }
+    }
+
+    /// A decoded audio packet (16-bit interleaved stereo). False when it was late or a duplicate.
+    pub fn audio_push(&self, seq: u32, sender_us: u64, pcm: &[i16]) -> bool {
+        let now = self.shared.now_us();
+        self.shared.jitter.lock().unwrap().push(seq, sender_us, now, |out| {
+            out.extend(pcm.iter().map(|&v| v as f32 / 32768.0));
+        })
+    }
+
+    /// Up to `max_frames` frames (interleaved f32 stereo) for the output device,
+    /// which still holds `device_queued` frames.
+    pub fn audio_pull(&self, max_frames: usize, device_queued: usize, out: &mut Vec<f32>) -> usize {
+        let now = self.shared.now_us();
+        self.shared.jitter.lock().unwrap().pull(now, max_frames, device_queued, out)
+    }
+
+    pub fn send_files(&self, items: Vec<crate::files::Upload>) {
+        let _ = self.shared.cmds.send(NetCmd::SendFiles(items));
     }
 
     pub fn input(&self, ev: pb::input_msg::Ev) {
