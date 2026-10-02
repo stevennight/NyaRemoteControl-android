@@ -1,0 +1,41 @@
+[package]
+name = "nya-android"
+description = "NyaRemoteControl Android client: native session core (QUIC, handshake, pairing, reconnect) behind JNI"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# The Kotlin app lives in app/; this crate builds libnya_android.so for it
+# (app/build.gradle.kts runs cargo-ndk). rlib so the tests run on the host.
+[lib]
+name = "nya_android"
+path = "rust/src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Shared crates from the common repository, checked out next to this one
+# (CI does the same; a release pins the commit in COMMON_REF).
+nya-proto = { path = "../common/crates/nya-proto" }
+nya-transport = { path = "../common/crates/nya-transport" }
+
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std", "ansi"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+crossbeam-channel = "0.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+jni = "0.21"
+
+[target.'cfg(target_os = "android")'.dependencies]
+android_log-sys = "0.3"
+
+[profile.release]
+lto = "thin"
+debug = "line-tables-only"
+
+[[test]]
+name = "loopback"
+path = "rust/tests/loopback.rs"

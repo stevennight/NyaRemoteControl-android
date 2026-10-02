@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A monitor with a cat-ear notch: 108dp adaptive icon canvas, content in the 66dp safe zone. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- ears -->
+    <path android:fillColor="#FFFFFF" android:pathData="M36,38 L41,27 L47,38 Z" />
+    <path android:fillColor="#FFFFFF" android:pathData="M61,38 L67,27 L72,38 Z" />
+    <!-- screen -->
+    <path android:fillColor="#FFFFFF" android:pathData="M32,36 h44 a4,4 0 0 1 4,4 v24 a4,4 0 0 1 -4,4 h-44 a4,4 0 0 1 -4,-4 v-24 a4,4 0 0 1 4,-4 z" />
+    <path android:fillColor="#3B6CF6" android:pathData="M34,40 h40 v22 h-40 z" />
+    <!-- stand -->
+    <path android:fillColor="#FFFFFF" android:pathData="M48,68 h12 l2,8 h-16 z" />
+    <path android:fillColor="#FFFFFF" android:pathData="M42,76 h24 v3 h-24 z" />
+    <!-- cursor -->
+    <path android:fillColor="#FFFFFF" android:pathData="M50,44 L50,58 L53.5,54.5 L56,60 L58.5,59 L56,53.5 L61,53.5 Z" />
+</vector>

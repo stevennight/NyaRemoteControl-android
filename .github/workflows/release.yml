@@ -1,0 +1,118 @@
+name: Release
+
+# Push a tag v<VERSION> (scripts/release.ps1 makes it) to build the signed APK
+# and publish a GitHub release. Versions with a suffix (0.2.0-beta.1) are
+# published as pre-releases.
+on:
+  push:
+    tags: ["v*"]
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish signed APK
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+      ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+    steps:
+      - name: Check out android
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: android
+          persist-credentials: false
+
+      - name: Check tag matches VERSION
+        id: version
+        run: |
+          version="$(tr -d '\r\n' < android/VERSION)"
+          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match VERSION ${version}" >&2
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          case "$version" in *-*) echo "prerelease=true" >> "$GITHUB_OUTPUT" ;; *) echo "prerelease=false" >> "$GITHUB_OUTPUT" ;; esac
+          ref="$(tr -d '\r\n' < android/COMMON_REF 2>/dev/null || echo main)"
+          echo "common: $ref"
+          echo "common=${ref}" >> "$GITHUB_OUTPUT"
+
+      - name: Check out common
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: stevennight/NyaRemoteControl-common
+          ref: ${{ steps.version.outputs.common }}
+          path: common
+          persist-credentials: false
+
+      - name: Set up Java
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Rust and Android NDK
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup target add aarch64-linux-android x86_64-linux-android
+          ndk="$(sed -n 's/^val ndkVersionPinned = "\(.*\)"$/\1/p' android/app/build.gradle.kts)"
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$ndk" > /dev/null
+          cargo install cargo-ndk --locked
+
+      - name: Test the Rust core
+        working-directory: android
+        run: cargo test --locked
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4
+
+      - name: Verify source
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon lintDebug testDebugUnitTest
+
+      - name: Restore Android signing key
+        run: |
+          for name in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
+            if [ -z "${!name}" ]; then
+              echo "Missing ${name} secret" >&2
+              exit 1
+            fi
+          done
+          keystore_path="$RUNNER_TEMP/nya-remote-android-release.jks"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$keystore_path"
+          echo "ANDROID_KEYSTORE_FILE=$keystore_path" >> "$GITHUB_ENV"
+
+      - name: Build signed release APK
+        working-directory: android
+        run: ./gradlew --no-daemon assembleRelease
+
+      - name: Verify APK signature and collect release files
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          apksigner="$(ls -d "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)"
+          apk=android/app/build/outputs/apk/release/app-release.apk
+          test -f "$apk" || { echo "Signed APK was not produced (is the keystore configured?)" >&2; exit 1; }
+          "$apksigner" verify --print-certs "$apk"
+          mkdir -p dist
+          name="NyaRemoteControl-Android_${VERSION}.apk"
+          cp "$apk" "dist/$name"
+          (cd dist && sha256sum "$name" > "$name.sha256")
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          name: NyaRemoteControl Android ${{ steps.version.outputs.version }}
+          prerelease: ${{ steps.version.outputs.prerelease }}
+          files: dist/*

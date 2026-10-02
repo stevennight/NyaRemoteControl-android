@@ -1,0 +1,13 @@
+/target
+/build
+/app/build
+/.gradle
+/.kotlin
+/local.properties
+/.idea
+*.iml
+# Signing material never goes into the repository (see README).
+*.jks
+*.keystore
+keystore.properties
+signing.properties
