@@ -73,6 +73,8 @@ class GestureEngine(
     private var lastX = 0f
     private var lastY = 0f
     private var maxPointers = 0
+    /** Every finger that touched during this gesture (a quick three-finger tap is often staggered). */
+    private val touched = HashSet<Int>()
 
     private var multiKind = MultiKind.UNDECIDED
     private var multiMoved = false
@@ -100,11 +102,14 @@ class GestureEngine(
     fun onTouch(action: TouchAction, pointers: List<Pt>, changedId: Int, t: Long) {
         when (action) {
             TouchAction.DOWN -> down(pointers.first { it.id == changedId }, t)
-            TouchAction.POINTER_DOWN -> pointerDown(pointers)
+            TouchAction.POINTER_DOWN -> {
+                touched += changedId
+                pointerDown(pointers)
+            }
             TouchAction.MOVE -> move(pointers)
             TouchAction.POINTER_UP -> pointerUp(pointers, changedId)
             TouchAction.UP -> up(t)
-            TouchAction.CANCEL -> cancel()
+            TouchAction.CANCEL -> cancel(t)
         }
     }
 
@@ -127,6 +132,8 @@ class GestureEngine(
         lastY = p.y
         downT = t
         maxPointers = 1
+        touched.clear()
+        touched += p.id
         wheelAccX = 0f
         wheelAccY = 0f
         longPressAt = t + cfg.longPressMs
@@ -145,10 +152,18 @@ class GestureEngine(
                 startCx = lastCx
                 startCy = lastCy
             }
-            // A third finger: measure from the new set so nothing jumps.
-            Phase.MULTI -> startMulti(pointers)
+            // Another finger: measure from the new set so nothing jumps.
+            Phase.MULTI -> rebase(pointers)
             else -> {}
         }
+    }
+
+    /** The set of fingers changed: movement counts from here (what moved before still counts). */
+    private fun rebase(pointers: List<Pt>) {
+        startMulti(pointers)
+        startSpan = lastSpan
+        startCx = lastCx
+        startCy = lastCy
     }
 
     private fun startMulti(pointers: List<Pt>) {
@@ -212,7 +227,7 @@ class GestureEngine(
     }
 
     private fun multiMove(pointers: List<Pt>) {
-        if (pointers.size < 2 || maxPointers > 2) return
+        if (pointers.size < 2 || maxPointers > 2 || touched.size > 2) return
         val a = pointers[0]
         val b = pointers[1]
         val span = hypot(a.x - b.x, a.y - b.y)
@@ -246,7 +261,8 @@ class GestureEngine(
     private fun pointerUp(pointers: List<Pt>, changedId: Int) {
         val rest = pointers.filter { it.id != changedId }
         when (phase) {
-            Phase.MULTI -> startMulti(rest)
+            Phase.MULTI -> rebase(rest)
+
             Phase.DRAG -> if (changedId == primary) {
                 out.button(BUTTON_LEFT, false)
                 phase = Phase.DONE
@@ -263,21 +279,24 @@ class GestureEngine(
             }
             Phase.LONG_PRESSED -> click(BUTTON_RIGHT)
             Phase.DRAG -> out.button(BUTTON_LEFT, false)
-            Phase.MULTI -> if (!multiMoved && t - downT <= cfg.multiTapMs + cfg.longPressMs) {
-                when (maxPointers) {
-                    2 -> click(BUTTON_RIGHT)
-                    3 -> out.toggleKeyboard()
-                }
+            Phase.MULTI -> if (isMultiTap(t)) {
+                if (touched.size >= 3) out.toggleKeyboard() else click(BUTTON_RIGHT)
             }
             else -> {}
         }
         reset()
     }
 
-    private fun cancel() {
+    private fun cancel(t: Long) {
         if (phase == Phase.DRAG) out.button(BUTTON_LEFT, false)
+        // Many phones watch three fingers for their screenshot gesture and take
+        // the touches away (CANCEL) as soon as the third one lands: still a tap.
+        if (phase == Phase.MULTI && touched.size >= 3 && isMultiTap(t)) out.toggleKeyboard()
         reset()
     }
+
+    private fun isMultiTap(t: Long) = !multiMoved && t - downT <= cfg.multiTapMs + cfg.longPressMs
+
 
     private fun reset() {
         phase = Phase.IDLE

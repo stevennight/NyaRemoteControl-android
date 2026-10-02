@@ -215,8 +215,9 @@ class SessionActivity : ComponentActivity(), SessionActions {
         // The soft keyboard covers the lower part: let the picture pan above it.
         ViewCompat.setOnApplyWindowInsetsListener(root) { _, insets ->
             val ime = insets.getInsets(WindowInsetsCompat.Type.ime()).bottom
-            val open = insets.isVisible(WindowInsetsCompat.Type.ime())
+            val open = insets.isVisible(WindowInsetsCompat.Type.ime()) || (Build.VERSION.SDK_INT < 30 && imeWanted)
             ui.keyboardOpen = open
+
             viewport.setBottomInset(if (open) ime.toFloat() + 46 * resources.displayMetrics.density else 0f)
             if (open) viewport.ensureVisible(gestures.cursorX, gestures.cursorY, 48 * resources.displayMetrics.density)
             insets
@@ -586,15 +587,47 @@ class SessionActivity : ComponentActivity(), SessionActions {
         settingsStore.update { it.copy(controlMode = mode) }
     }
 
-    override fun toggleKeyboard() {
-        val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
-        if (ui.keyboardOpen) {
-            imm.hideSoftInputFromWindow(keyboardView.windowToken, 0)
-            keyboardView.clearFocus()
+    /** The keyboard was asked for (insets tell the truth on Android 11+ only). */
+    private var imeWanted = false
+
+    private fun imeVisible(): Boolean =
+        if (Build.VERSION.SDK_INT >= 30) {
+            ViewCompat.getRootWindowInsets(root)?.isVisible(WindowInsetsCompat.Type.ime()) == true
         } else {
-            keyboardView.requestFocus()
-            imm.showSoftInput(keyboardView, InputMethodManager.SHOW_IMPLICIT)
+            imeWanted
         }
+
+    override fun toggleKeyboard() {
+        if (imeVisible() || ui.keyboardOpen) hideKeyboard() else showKeyboard()
+    }
+
+    private fun showKeyboard() {
+        imeWanted = true
+        if (Build.VERSION.SDK_INT < 30) ui.keyboardOpen = true
+        val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+        keyboardView.requestFocus()
+        // The IME only serves the view once the focus change went through: ask on the next frame,
+        // and once more shortly after if it still isn't up (some IMEs ignore the first request).
+        keyboardView.post {
+            WindowCompat.getInsetsController(window, keyboardView).show(WindowInsetsCompat.Type.ime())
+            imm.showSoftInput(keyboardView, 0)
+        }
+        main.postDelayed({
+            if (imeWanted && !imeVisible()) {
+                keyboardView.requestFocus()
+                imm.restartInput(keyboardView)
+                imm.showSoftInput(keyboardView, 0)
+            }
+        }, 350)
+    }
+
+    private fun hideKeyboard() {
+        imeWanted = false
+        if (Build.VERSION.SDK_INT < 30) ui.keyboardOpen = false
+        val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+        WindowCompat.getInsetsController(window, keyboardView).hide(WindowInsetsCompat.Type.ime())
+        imm.hideSoftInputFromWindow(keyboardView.windowToken, 0)
+        keyboardView.clearFocus()
     }
 
     override fun setGameMode(game: Boolean) {

@@ -107,7 +107,46 @@ class GestureEngineTest {
     }
 
     @Test
+    fun staggeredThreeFingerTapTogglesKeyboard() {
+        // Finger 0 lifts before finger 2 lands: never three at once.
+        val a = Pt(0, 100f, 100f)
+        val b = Pt(1, 200f, 100f)
+        val c = Pt(2, 300f, 120f)
+        g.onTouch(TouchAction.DOWN, listOf(a), 0, 0)
+        g.onTouch(TouchAction.POINTER_DOWN, listOf(a, b), 1, 20)
+        g.onTouch(TouchAction.POINTER_UP, listOf(a, b), 0, 60)
+        g.onTouch(TouchAction.POINTER_DOWN, listOf(b, c), 2, 70)
+        g.onTouch(TouchAction.MOVE, listOf(b, c), 0, 80)
+        g.onTouch(TouchAction.POINTER_UP, listOf(b, c), 1, 120)
+        g.onTouch(TouchAction.UP, listOf(c), 2, 150)
+        assertEquals(listOf("keyboard"), log)
+    }
+
+    @Test
+    fun threeFingersTakenAwayBySystemStillToggleKeyboard() {
+        val a = Pt(0, 100f, 100f)
+        val b = Pt(1, 200f, 100f)
+        val c = Pt(2, 300f, 100f)
+        g.onTouch(TouchAction.DOWN, listOf(a), 0, 0)
+        g.onTouch(TouchAction.POINTER_DOWN, listOf(a, b), 1, 10)
+        g.onTouch(TouchAction.POINTER_DOWN, listOf(a, b, c), 2, 20)
+        g.onTouch(TouchAction.CANCEL, emptyList(), 0, 40)
+        assertEquals(listOf("keyboard"), log)
+    }
+
+    @Test
+    fun twoFingerCancelDoesNothing() {
+        val a = Pt(0, 100f, 100f)
+        val b = Pt(1, 200f, 100f)
+        g.onTouch(TouchAction.DOWN, listOf(a), 0, 0)
+        g.onTouch(TouchAction.POINTER_DOWN, listOf(a, b), 1, 10)
+        g.onTouch(TouchAction.CANCEL, emptyList(), 0, 40)
+        assertEquals(emptyList<String>(), log)
+    }
+
+    @Test
     fun pinchZoomsAndTwoFingersPan() {
+
         g.onTouch(TouchAction.DOWN, listOf(Pt(0, 400f, 250f)), 0, 0)
         g.onTouch(TouchAction.POINTER_DOWN, listOf(Pt(0, 400f, 250f), Pt(1, 600f, 250f)), 1, 10)
         g.onTouch(TouchAction.MOVE, listOf(Pt(0, 300f, 250f), Pt(1, 700f, 250f)), 0, 50)
