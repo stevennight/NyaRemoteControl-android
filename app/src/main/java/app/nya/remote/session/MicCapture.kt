@@ -6,6 +6,10 @@ import android.media.AudioRecord
 import android.media.MediaCodec
 import android.media.MediaFormat
 import android.media.MediaRecorder
+import android.media.audiofx.AcousticEchoCanceler
+import android.media.audiofx.NoiseSuppressor
+import android.os.Build
+
 import android.util.Log
 import kotlin.concurrent.thread
 
@@ -13,6 +17,11 @@ import kotlin.concurrent.thread
  * The phone's microphone to the host (FEATURE_MICROPHONE): 48 kHz mono
  * capture, duplicated to stereo, Opus by MediaCodec (Android 10+), one MIC
  * datagram per packet. The host plays it into its virtual audio cable.
+ *
+ * Other apps on the phone keep their microphone: the capture uses the plain
+ * MIC source marked not privacy-sensitive (VOICE_COMMUNICATION would silence
+ * every other recorder), and the session stops capturing while it is in the
+ * background. Echo cancellation and noise suppression are added as effects.
  */
 class MicCapture(private val session: RemoteSession, private val onError: (String) -> Unit) {
     @Volatile
@@ -47,17 +56,35 @@ class MicCapture(private val session: RemoteSession, private val onError: (Strin
         codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
         codec.start()
         val minBuf = AudioRecord.getMinBufferSize(RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
-        val rec = AudioRecord(
-            MediaRecorder.AudioSource.VOICE_COMMUNICATION,
-            RATE,
-            AudioFormat.CHANNEL_IN_MONO,
-            AudioFormat.ENCODING_PCM_16BIT,
-            maxOf(minBuf, FRAME * 2 * 4),
-        )
+        val builder = AudioRecord.Builder()
+            .setAudioSource(MediaRecorder.AudioSource.MIC)
+            .setAudioFormat(
+                AudioFormat.Builder()
+                    .setSampleRate(RATE)
+                    .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .build(),
+            )
+            .setBufferSizeInBytes(maxOf(minBuf, FRAME * 2 * 4))
+        // Share the microphone: another app in front (or the keyboard's voice input) gets it too.
+        if (Build.VERSION.SDK_INT >= 30) builder.setPrivacySensitive(false)
+        val rec = builder.build()
         if (rec.state != AudioRecord.STATE_INITIALIZED) {
+            rec.release()
             codec.release()
             onError("无法打开麦克风")
             return
+        }
+        // What VOICE_COMMUNICATION would have done: no echo of the host's sound, less noise.
+        val effects = listOfNotNull(
+            if (AcousticEchoCanceler.isAvailable()) AcousticEchoCanceler.create(rec.audioSessionId) else null,
+            if (NoiseSuppressor.isAvailable()) NoiseSuppressor.create(rec.audioSessionId) else null,
+        )
+        effects.forEach {
+            try {
+                it.enabled = true
+            } catch (_: Exception) {
+            }
         }
         rec.startRecording()
         val mono = ShortArray(FRAME)
@@ -97,6 +124,7 @@ class MicCapture(private val session: RemoteSession, private val onError: (Strin
                 }
             }
         } finally {
+            effects.forEach { it.release() }
             rec.stop()
             rec.release()
             try {

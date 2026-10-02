@@ -444,8 +444,31 @@ class SessionActivity : ComponentActivity(), SessionActions {
         if (remember) settingsStore.update { it.copy(mic = false) }
     }
 
+    /** The microphone was on when the app went to the background: on again when it returns. */
+    private var micPaused = false
+
+    override fun onStart() {
+        super.onStart()
+        if (micPaused) {
+            micPaused = false
+            if (session != null) startMic()
+        }
+    }
+
+    override fun onStop() {
+        // Other apps (voice input, calls, assistants) get the microphone while we are not in front.
+        if (mic != null) {
+            mic?.stop()
+            mic = null
+            micPaused = true
+        }
+        super.onStop()
+    }
+
     private fun closeSession() {
+        micPaused = false
         stopMic(remember = false)
+
         if (::usbSharing.isInitialized) usbSharing.releaseAll()
         if (::gamepads.isInitialized) gamepads.clear()
         stopDecoder()
