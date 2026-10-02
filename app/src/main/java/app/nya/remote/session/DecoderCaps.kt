@@ -6,8 +6,20 @@ import android.os.Build
 import app.nya.remote.core.DecoderCap
 
 /** A video decoder on this phone. */
-data class Decoder(val codec: String, val mime: String, val name: String, val hardware: Boolean, val maxWidth: Int, val maxHeight: Int) {
+data class Decoder(
+    val codec: String,
+    val mime: String,
+    val name: String,
+    val hardware: Boolean,
+    val maxWidth: Int,
+    val maxHeight: Int,
+    /** HEVC Main10: HDR10 possible. */
+    val tenBit: Boolean = false,
+) {
     fun cap() = DecoderCap(codec, hardware, maxWidth, maxHeight)
+
+    /** The 10-bit variant, reported in addition (protocol: CodecCap.ten_bit). */
+    fun tenBitCap() = DecoderCap(codec, hardware, maxWidth, maxHeight, tenBit = true)
 }
 
 object DecoderCaps {
@@ -39,12 +51,17 @@ object DecoderCaps {
             val best = candidates.firstOrNull { isHardware(it) } ?: candidates.firstOrNull() ?: continue
             val hw = isHardware(best)
             if (!hw && codec != "h264") continue
-            val vc = try {
-                best.getCapabilitiesForType(mime).videoCapabilities
+            val caps = try {
+                best.getCapabilitiesForType(mime)
             } catch (_: Exception) {
                 null
             }
-            out += Decoder(codec, mime, best.name, hw, vc?.supportedWidths?.upper ?: 0, vc?.supportedHeights?.upper ?: 0)
+            val vc = caps?.videoCapabilities
+            val main10 = mime == "video/hevc" && caps?.profileLevels?.any {
+                it.profile == MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10 ||
+                    it.profile == MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10HDR10
+            } == true
+            out += Decoder(codec, mime, best.name, hw, vc?.supportedWidths?.upper ?: 0, vc?.supportedHeights?.upper ?: 0, main10 && hw)
         }
         if (out.isEmpty()) {
             // Nothing found at all: let MediaCodec pick at decode time.

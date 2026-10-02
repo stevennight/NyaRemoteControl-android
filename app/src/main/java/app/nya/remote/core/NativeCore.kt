@@ -58,6 +58,24 @@ object NativeCore {
     /** `[{"fd":..,"name":..,"size":..}]`; the core takes ownership of the (detached) descriptors. */
     @JvmStatic external fun sendFiles(handle: Long, json: String)
 
+    /** One Opus packet (48 kHz stereo) from the phone's microphone. */
+    @JvmStatic external fun mic(handle: Long, opus: ByteArray)
+
+    /** An image copied on the phone, as CF_DIB bytes. */
+    @JvmStatic external fun clipboardImage(handle: Long, dib: ByteArray)
+
+    /** Files copied on the phone (paths of copies in the app's cache, JSON array), offered for pasting on the host. */
+    @JvmStatic external fun clipboardFiles(handle: Long, pathsJson: String)
+
+    /** Shared folders: `[{"name","path","readOnly"}]`. */
+    @JvmStatic external fun setShares(handle: Long, json: String)
+
+    /** Share a USB device whose interfaces the app claimed; [fd] stays owned by the app. */
+    @JvmStatic external fun usbShare(handle: Long, busid: String, devnum: Int, fd: Int, descriptors: ByteArray, description: String): Boolean
+
+    @JvmStatic external fun usbUnshare(handle: Long, busid: String)
+
+
     @JvmStatic external fun updateStream(handle: Long, streamJson: String)
     @JvmStatic external fun setMode(handle: Long, game: Boolean)
     @JvmStatic external fun sendSas(handle: Long)

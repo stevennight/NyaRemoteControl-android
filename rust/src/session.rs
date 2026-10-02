@@ -23,6 +23,14 @@ pub enum NetCmd {
     Input(pb::InputMsg),
     Control(pb::ControlMsg),
     SendFiles(Vec<crate::files::Upload>),
+    /// A MIC datagram (Opus from the phone's microphone).
+    Mic(Vec<u8>),
+    /// CF_DIB bytes of an image copied on the phone.
+    SendImage(Vec<u8>),
+    /// Files copied on the phone (staged in the app's cache): offer them for pasting on the host.
+    OfferFiles(Vec<std::path::PathBuf>),
+    /// New list of shared folders.
+    SetShares(nya_transport::folders::Shares),
     Quit,
 }
 
@@ -61,6 +69,12 @@ pub struct Shared {
     pub jitter: Mutex<JitterBuffer>,
     /// Local clock for the jitter buffer.
     epoch: Instant,
+    /// Files copied on the phone, kept until the host pastes them.
+    pub clip_out: Mutex<nya_transport::clipfiles::Outgoing>,
+    /// Folders the host may read (and write) through FS streams.
+    pub shares: Mutex<Arc<nya_transport::folders::Shares>>,
+    /// USB devices shared with the host.
+    pub usb: crate::usb::Devices,
 }
 
 impl Shared {
@@ -144,6 +158,8 @@ pub struct Session {
     video_pending: Mutex<Option<VideoOut>>,
     audio: Receiver<Vec<u8>>,
     runtime: Mutex<Option<tokio::runtime::Runtime>>,
+    /// Sequence numbers of MIC datagrams.
+    pub mic_seq: std::sync::atomic::AtomicU32,
 }
 
 fn next<T>(rx: &Receiver<T>, timeout: Duration) -> Next<T> {
@@ -177,9 +193,22 @@ impl Session {
             pair_reply: Mutex::new(None),
             jitter: Mutex::new(JitterBuffer::new()),
             epoch: Instant::now(),
+            clip_out: Mutex::new(Default::default()),
+            shares: Mutex::new(Arc::new(crate::options::shares(&cfg.shares))),
+            usb: Default::default(),
+
         });
         runtime.spawn(crate::net::main(cfg, identity, shared.clone(), cmds_rx));
-        Ok(Self { shared, events, video, video_pending: Mutex::new(None), audio, runtime: Mutex::new(Some(runtime)) })
+        Ok(Self {
+            shared,
+            events,
+            video,
+            video_pending: Mutex::new(None),
+            audio,
+            runtime: Mutex::new(Some(runtime)),
+            mic_seq: Default::default(),
+        })
+
     }
 
     pub fn poll_event(&self, timeout: Duration) -> Next<Event> {
@@ -224,6 +253,10 @@ impl Session {
 
     pub fn send_files(&self, items: Vec<crate::files::Upload>) {
         let _ = self.shared.cmds.send(NetCmd::SendFiles(items));
+    }
+
+    pub fn cmd(&self, c: NetCmd) {
+        let _ = self.shared.cmds.send(c);
     }
 
     pub fn input(&self, ev: pb::input_msg::Ev) {

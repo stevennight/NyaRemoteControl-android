@@ -58,6 +58,8 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import app.nya.remote.core.CoreEvent
+import app.nya.remote.core.HostDisplay
+
 import app.nya.remote.core.StatsLine
 import app.nya.remote.data.ControlMode
 import app.nya.remote.input.KeyMap
@@ -98,6 +100,17 @@ class SessionUi(initialMode: ControlMode, showStats: Boolean, gameMode: Boolean,
     var offer by mutableStateOf<CoreEvent.FileOffer?>(null)
     /** Upload / download in progress (or just finished). */
     var transfer by mutableStateOf<CoreEvent.Transfer?>(null)
+    var displays by mutableStateOf<List<HostDisplay>>(emptyList())
+    /** Host display shown (0 = primary). */
+    var displayId by mutableStateOf(0)
+    /** The host can receive the microphone (feature and a virtual cable installed). */
+    var micAvailable by mutableStateOf(false)
+    var micOn by mutableStateOf(false)
+    var usb by mutableStateOf(false)
+    var usbItems: List<UsbSharing.Item> = emptyList()
+    var folderMount by mutableStateOf<CoreEvent.FolderMount?>(null)
+    /** A print job from the host waiting for "print" or "save". */
+    var printJob by mutableStateOf<String?>(null)
 }
 
 interface SessionActions {
@@ -111,6 +124,10 @@ interface SessionActions {
     fun sendClipboard()
     fun takeControl(kick: Boolean)
     fun resetZoom()
+    fun pickDisplay(id: Int)
+    fun toggleMic()
+    fun toggleUsb(item: UsbSharing.Item)
+    fun printJob(print: Boolean)
     fun pickFiles()
     fun acceptOffer()
     fun dismissOffer()
@@ -138,6 +155,7 @@ fun SessionOverlay(ui: SessionUi, keys: KeyboardController, actions: SessionActi
             Modifier.align(Alignment.BottomStart).padding(start = 16.dp, bottom = if (ui.keyboardOpen) 0.dp else 16.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
+            ui.printJob?.let { PrintBanner(it, actions) }
             ui.offer?.let { OfferBanner(it, actions) }
             ui.transfer?.let { TransferChip(it) }
         }
@@ -185,6 +203,18 @@ private fun sizeText(bytes: Long): String = when {
     bytes >= 1L shl 20 -> "%.1f MB".format(bytes / (1L shl 20).toFloat())
     bytes >= 1L shl 10 -> "%.0f KB".format(bytes / (1L shl 10).toFloat())
     else -> "$bytes B"
+}
+
+@Composable
+private fun PrintBanner(path: String, actions: SessionActions) {
+    Row(
+        Modifier.background(Color(0xE6202226), RoundedCornerShape(14.dp)).padding(start = 14.dp, end = 4.dp, top = 4.dp, bottom = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text("电脑发来打印：${path.substringAfterLast('/').substringAfterLast('\\')}", color = Color.White, fontSize = 13.sp)
+        TextButton(onClick = { actions.printJob(true) }) { Text("打印", color = AccentCyan) }
+        TextButton(onClick = { actions.printJob(false) }) { Text("保存", color = Color(0xFFB8BBC2)) }
+    }
 }
 
 @Composable
@@ -375,6 +405,55 @@ private fun SidePanel(ui: SessionUi, actions: SessionActions) {
                     Tile("发送文件到电脑", Modifier.weight(1f)) { actions.pickFiles() }
                 }
                 Text("在电脑上复制文件后，这里会提示保存到手机", fontSize = 12.sp, color = Color.Gray, modifier = Modifier.padding(top = 6.dp))
+            }
+        }
+
+        if (ui.displays.size > 1) {
+            Card {
+                Text("显示器", fontSize = 13.sp, color = Color.Gray)
+                Column(Modifier.fillMaxWidth().padding(top = 8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    ui.displays.chunked(2).forEach { row ->
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            row.forEach { d ->
+                                val label = (if (d.isVirtual) "虚拟屏" else d.name.ifBlank { "显示器 ${d.id}" }) + " ${d.width}×${d.height}"
+                                val selected = d.id == ui.displayId || (ui.displayId == 0 && d.primary)
+                                Choice(label, selected, Modifier.weight(1f)) { actions.pickDisplay(if (d.primary) 0 else d.id) }
+                            }
+                            if (row.size == 1) Spacer(Modifier.weight(1f))
+                        }
+                    }
+                }
+            }
+        }
+
+        if (ui.micAvailable || ui.usb || ui.folderMount != null) {
+            Card {
+                Text("外设", fontSize = 13.sp, color = Color.Gray)
+                if (ui.micAvailable) {
+                    Row(Modifier.fillMaxWidth().padding(top = 8.dp)) {
+                        Tile(if (ui.micOn) "麦克风：开" else "麦克风：关", Modifier.weight(1f), selected = ui.micOn) { actions.toggleMic() }
+                    }
+                }
+                ui.folderMount?.let { m ->
+                    Text(
+                        if (m.mounted) "手机文件夹已挂载到电脑 ${m.mountPoint}" else "文件夹挂载：${m.message}",
+                        fontSize = 13.sp,
+                        modifier = Modifier.padding(top = 8.dp),
+                    )
+                }
+                if (ui.usb) {
+                    Text("USB 设备（手机 OTG 接口上的设备，共享给电脑）", fontSize = 12.sp, color = Color.Gray, modifier = Modifier.padding(top = 8.dp))
+                    if (ui.usbItems.isEmpty()) Text("没有接入 USB 设备", fontSize = 13.sp)
+                    ui.usbItems.forEach { item ->
+                        Row(Modifier.fillMaxWidth().padding(top = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text(item.name, fontSize = 13.sp)
+                                if (item.status.isNotBlank()) Text(item.status, fontSize = 11.sp, color = Color.Gray)
+                            }
+                            TextButton(onClick = { actions.toggleUsb(item) }) { Text(if (item.shared) "停止共享" else "共享") }
+                        }
+                    }
+                }
             }
         }
 

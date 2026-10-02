@@ -511,6 +511,7 @@ dependencies = [
  "base64",
  "crossbeam-channel",
  "jni",
+ "libc",
  "nya-jitter",
  "nya-proto",
  "nya-transport",

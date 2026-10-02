@@ -24,6 +24,10 @@ import android.view.inputmethod.InputMethodManager
 import android.hardware.input.InputManager
 import androidx.activity.result.contract.ActivityResultContracts
 import app.nya.remote.data.Downloads
+import app.nya.remote.data.Shares
+import app.nya.remote.input.KeyMap
+import android.view.Display
+
 import app.nya.remote.input.Gamepads
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonArray
@@ -81,8 +85,17 @@ class SessionActivity : ComponentActivity(), SessionActions {
     private var decoders: List<Decoder> = emptyList()
     private var surfaceReady = false
     private var guideShown = false
-    private var untypableHinted = false
     private lateinit var gamepads: Gamepads
+    private lateinit var clipboard: ClipboardBridge
+    private lateinit var usbSharing: UsbSharing
+    private var mic: MicCapture? = null
+    private var micFeature = false
+    private var streamHdr = false
+    /** Keys and pastes leave in order (a paste waits for the host clipboard). */
+    private val keyOut = java.util.concurrent.Executors.newSingleThreadExecutor()
+    private val micPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) startMic() else Toast.makeText(this, "没有麦克风权限", Toast.LENGTH_SHORT).show()
+    }
     private val inputManager by lazy { getSystemService(Context.INPUT_SERVICE) as InputManager }
     private val padListener = object : InputManager.InputDeviceListener {
         override fun onInputDeviceAdded(deviceId: Int) {}
@@ -120,20 +133,29 @@ class SessionActivity : ComponentActivity(), SessionActions {
         }
 
         keys = KeyboardController(
-            send = { k, down -> session?.key(k.code, k.extended, down) },
-            sendText = { session?.text(it) },
+            send = { k, down -> keyOut.execute { session?.key(k.code, k.extended, down) } },
+            sendText = { t -> keyOut.execute { session?.text(t) } },
+            paste = { t ->
+                // Older hosts can't type Unicode: put the text on their clipboard, then Ctrl+V.
+                keyOut.execute {
+                    val s = session ?: return@execute
+                    s.sendClipboard(t)
+                    Thread.sleep(150)
+                    s.key(KeyMap.LCTRL.code, false, true)
+                    s.key(0x2F, false, true)
+                    s.key(0x2F, false, false)
+                    s.key(KeyMap.LCTRL.code, false, false)
+                }
+            },
         )
+        clipboard = ClipboardBridge(this) { session }
+        usbSharing = UsbSharing(this, { session }) { msg -> Toast.makeText(this, msg, Toast.LENGTH_LONG).show() }
+        ui.usbItems = usbSharing.items
         gamepads = Gamepads { i, connected, st ->
             session?.gamepad(i, connected, st.buttons, st.leftTrigger, st.rightTrigger, st.lx, st.ly, st.rx, st.ry)
         }
         gamepads.onFirstPad = { name -> Toast.makeText(this, "手柄已连接：$name（电脑上是虚拟 Xbox 手柄）", Toast.LENGTH_SHORT).show() }
         inputManager.registerInputDeviceListener(padListener, main)
-        keys.onUntypable = {
-            if (!untypableHinted) {
-                untypableHinted = true
-                Toast.makeText(this, "中文等字符请切换到英文键盘，用电脑的输入法输入", Toast.LENGTH_LONG).show()
-            }
-        }
         val density = resources.displayMetrics.density
         gestures = GestureEngine(
             viewport,
@@ -221,9 +243,17 @@ class SessionActivity : ComponentActivity(), SessionActions {
         return (d?.refreshRate ?: 60f).roundToInt()
     }
 
+    /** The screen shows HDR10 and a decoder handles HEVC Main10. */
+    @Suppress("DEPRECATION")
+    private fun hdrCapable(): Boolean {
+        val d = (if (Build.VERSION.SDK_INT >= 30) display else windowManager.defaultDisplay) ?: return false
+        val screen = d.hdrCapabilities?.supportedHdrTypes?.contains(Display.HdrCapabilities.HDR_TYPE_HDR10) == true
+        return screen && decoders.any { it.tenBit }
+    }
+
     private fun currentStreamOptions() = settingsStore.load().let { s ->
         val size = screenSize()
-        streamOptions(s.copy(gameMode = ui.gameMode), size.x, size.y, refreshRate())
+        streamOptions(s.copy(gameMode = ui.gameMode), size.x, size.y, refreshRate(), hdrCapable(), ui.displayId)
     }
 
     private fun connect() {
@@ -234,10 +264,11 @@ class SessionActivity : ComponentActivity(), SessionActions {
             pairCode = pairCode,
             clientName = "${Build.MANUFACTURER} ${Build.MODEL}".trim(),
             clientVersion = BuildConfig.VERSION_NAME,
-            decoders = decoders.map { it.cap() },
+            decoders = decoders.map { it.cap() } + decoders.filter { it.tenBit && hdrCapable() }.map { it.tenBitCap() },
             maxFps = minOf(refreshRate(), s.maxFps),
             stream = currentStreamOptions(),
             downloadDir = Downloads.receiveDir(this).absolutePath,
+            shares = if (Shares.accessGranted()) s.shares else emptyList(),
         )
         pairCode = null
         ui.status = Status.Connecting
@@ -261,11 +292,11 @@ class SessionActivity : ComponentActivity(), SessionActions {
                 ui.needPairing = false
                 ui.fileTransfer = e.fileTransfer
                 ui.gamepad = e.gamepad
-                if (keys.textInput != e.textInput) {
-                    keys.textInput = e.textInput
-                    // The keyboard type depends on it (phone IME with Unicode text, plain keys otherwise).
-                    (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager).restartInput(keyboardView)
-                }
+                ui.usb = e.usb
+                keys.textInput = e.textInput
+                clipboard.images = e.clipboardImage
+                clipboard.files = e.clipboardFiles
+                micFeature = e.microphone
                 host = host.copy(
                     fingerprint = e.fingerprint,
                     fingerprintShort = e.fingerprintShort,
@@ -284,10 +315,17 @@ class SessionActivity : ComponentActivity(), SessionActions {
                 ui.needPairing = false
                 ui.status = Status.Disconnected(e.message)
             }
-            is CoreEvent.SessionInfo -> if (e.hostName.isNotBlank()) ui.hostName = host.name.ifBlank { e.hostName }
+            is CoreEvent.SessionInfo -> {
+                if (e.hostName.isNotBlank()) ui.hostName = host.name.ifBlank { e.hostName }
+                ui.displays = e.displays
+                ui.micAvailable = micFeature && e.micDevice.isNotBlank()
+                if (ui.micAvailable && settingsStore.load().mic && mic == null) toggleMic()
+            }
             is CoreEvent.StreamStarted -> {
                 ui.stream = e
                 cursorView.setSource(e.sourceWidth, e.sourceHeight)
+                streamHdr = e.hdr
+                decoder?.hdr = e.hdr
             }
             is CoreEvent.StreamError -> Toast.makeText(this, e.message, Toast.LENGTH_LONG).show()
             is CoreEvent.Role -> ui.role = e
@@ -296,10 +334,16 @@ class SessionActivity : ComponentActivity(), SessionActions {
                 cursorView.setState(e.shapeId, e.visible, e.x, e.y)
                 cursorView.remotePosition()?.let { (rx, ry) -> gestures.hostCursor(rx, ry) }
             }
-            is CoreEvent.Clipboard -> if (settingsStore.load().syncClipboard) {
-                val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                cm.setPrimaryClip(ClipData.newPlainText("NyaRemoteControl", e.text))
+            is CoreEvent.Clipboard -> if (settingsStore.load().syncClipboard) clipboard.fromHostText(e.text)
+            is CoreEvent.ClipboardImage -> if (settingsStore.load().syncClipboard) {
+                if (clipboard.fromHostImage(e.path)) Toast.makeText(this, "已复制电脑上的图片", Toast.LENGTH_SHORT).show()
             }
+            is CoreEvent.PrintJob -> ui.printJob = e.path
+            is CoreEvent.FolderMount -> {
+                ui.folderMount = e
+                if (!e.mounted && e.message.isNotBlank()) Toast.makeText(this, e.message, Toast.LENGTH_LONG).show()
+            }
+            is CoreEvent.UsbStatus -> usbSharing.status(e.busid, e.attached, e.message)
             is CoreEvent.Stats -> ui.stats = e.line
             is CoreEvent.FileOffer -> ui.offer = e
             is CoreEvent.Transfer -> onTransfer(e)
@@ -316,7 +360,10 @@ class SessionActivity : ComponentActivity(), SessionActions {
                 surfaceView.holder.setFixedSize(w, h)
                 viewport.setContent(w.toFloat(), h.toFloat())
             }
-        }.also { it.start() }
+        }.also {
+            it.hdr = streamHdr
+            it.start()
+        }
     }
 
     private fun stopDecoder() {
@@ -374,7 +421,30 @@ class SessionActivity : ComponentActivity(), SessionActions {
         session?.sendFiles(picked.toString())
     }
 
+    private fun startMic() {
+        val s = session ?: return
+        if (mic != null) return
+        mic = MicCapture(s) { msg ->
+            main.post {
+                Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+                mic = null
+                ui.micOn = false
+            }
+        }.also { it.start() }
+        ui.micOn = true
+        settingsStore.update { it.copy(mic = true) }
+    }
+
+    private fun stopMic(remember: Boolean = true) {
+        mic?.stop()
+        mic = null
+        ui.micOn = false
+        if (remember) settingsStore.update { it.copy(mic = false) }
+    }
+
     private fun closeSession() {
+        stopMic(remember = false)
+        if (::usbSharing.isInitialized) usbSharing.releaseAll()
         if (::gamepads.isInitialized) gamepads.clear()
         stopDecoder()
         audio?.stop()
@@ -387,6 +457,8 @@ class SessionActivity : ComponentActivity(), SessionActions {
     override fun onDestroy() {
         main.removeCallbacksAndMessages(null)
         if (::gamepads.isInitialized) inputManager.unregisterInputDeviceListener(padListener)
+        if (::usbSharing.isInitialized) usbSharing.close()
+        keyOut.shutdown()
         if (::ui.isInitialized) closeSession()
         super.onDestroy()
     }
@@ -552,14 +624,42 @@ class SessionActivity : ComponentActivity(), SessionActions {
     }
 
     override fun sendClipboard() {
-        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-        val text = cm.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(this)?.toString()
-        if (text.isNullOrEmpty()) {
-            Toast.makeText(this, "手机剪贴板里没有文字", Toast.LENGTH_SHORT).show()
-            return
+        Toast.makeText(this, clipboard.sendToHost(), Toast.LENGTH_SHORT).show()
+    }
+
+    override fun pickDisplay(id: Int) {
+        if (ui.displayId == id) return
+        ui.displayId = id
+        session?.updateStream(currentStreamOptions())
+    }
+
+    override fun toggleMic() {
+        if (mic != null) return stopMic()
+        if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) == android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            startMic()
+        } else {
+            micPermission.launch(android.Manifest.permission.RECORD_AUDIO)
         }
-        session?.sendClipboard(text)
-        Toast.makeText(this, "已发送到电脑剪贴板", Toast.LENGTH_SHORT).show()
+    }
+
+    override fun toggleUsb(item: UsbSharing.Item) = usbSharing.toggle(item)
+
+    override fun printJob(print: Boolean) {
+        val path = ui.printJob ?: return
+        ui.printJob = null
+        val f = java.io.File(path)
+        if (print) {
+            PdfPrint.print(this, f)
+        } else {
+            thread(name = "nya-save") {
+                val msg = try {
+                    "已保存到 ${Downloads.saveAll(this, listOf(f))}"
+                } catch (ex: Exception) {
+                    "保存失败：${ex.message}"
+                }
+                main.post { Toast.makeText(this, msg, Toast.LENGTH_LONG).show() }
+            }
+        }
     }
 
     override fun takeControl(kick: Boolean) {

@@ -1,7 +1,8 @@
 //! Connection, handshake, pairing and the long-running session with automatic
 //! reconnection. A trimmed port of the Windows client's net.rs: video, audio,
-//! cursor, input (keys, text, gamepads), clipboard text, file transfer and
-//! stream control; no USB, folder mount, printing or clipboard files.
+//! cursor, input (keys, text, gamepads), clipboard (text, images, files),
+//! file transfer, printing, microphone, folder mount, USB tunnels and stream
+//! control. Not offered: 4:4:4 (phone decoders are 4:2:0).
 
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
@@ -45,6 +46,13 @@ pub fn local_version() -> LocalVersion {
         Feature::FileTransfer,
         Feature::Gamepad,
         Feature::TextInput,
+        Feature::ClipboardImage,
+        Feature::ClipboardFiles,
+        Feature::Microphone,
+        Feature::FolderMount,
+        Feature::Print,
+        Feature::Hdr,
+        Feature::UsbRedirect,
     ]
     .into_iter()
     .map(|f| f as u32)
@@ -129,6 +137,7 @@ struct Params {
     start: pb::StartStream,
     download_dir: Option<std::path::PathBuf>,
 }
+
 
 enum End {
     UserQuit,
@@ -224,6 +233,13 @@ async fn supervise(first: Link, mut p: Params, mut cmds: mpsc::UnboundedReceiver
             text_input: l.neg.has(Feature::TextInput),
             file_transfer: l.neg.has(Feature::FileTransfer),
             gamepad: l.neg.has(Feature::Gamepad),
+            clipboard_image: l.neg.has(Feature::ClipboardImage),
+            clipboard_files: l.neg.has(Feature::FileTransfer) && l.neg.has(Feature::ClipboardFiles),
+            microphone: l.neg.has(Feature::Microphone),
+            folder_mount: l.neg.has(Feature::FolderMount),
+            print: l.neg.has(Feature::Print),
+            usb: l.neg.has(Feature::UsbRedirect),
+            hdr: l.neg.has(Feature::Hdr),
         });
         match run(l, &mut p, &mut cmds, sh).await {
             End::UserQuit => return sh.event(Event::Disconnected { message: "已断开".into() }),
@@ -252,6 +268,10 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
     let setup = async {
         write_msg(&mut send, &ctl(Msg::ClientCaps(p.caps.clone()))).await?;
         write_msg(&mut send, &ctl(Msg::StartStream(p.start.clone()))).await?;
+        let shares = sh.shares.lock().unwrap().clone();
+        if neg.has(Feature::FolderMount) && !shares.0.is_empty() {
+            write_msg(&mut send, &ctl(Msg::SharedFolders(shares.to_pb()))).await?;
+        }
         let mut input = conn.open_uni().await?;
         input.set_priority(20)?;
         let mut prelude = Vec::new();
@@ -265,15 +285,44 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
     };
 
     let files_on = neg.has(Feature::FileTransfer);
+    let images_on = neg.has(Feature::ClipboardImage);
+    let clip_files_on = files_on && neg.has(Feature::ClipboardFiles);
+    let mic_on = neg.has(Feature::Microphone);
+    let mount_on = neg.has(Feature::FolderMount);
     let downloads = Arc::new(crate::files::Downloads::default());
-    let dl_dir = if files_on { p.download_dir.clone() } else { None };
-    let uni = tokio::spawn(accept_uni(conn.clone(), sh.clone(), neg.has(Feature::MultiStream), downloads.clone(), dl_dir));
-    // The host opens bidi streams only for features we don't offer.
+    let receive = crate::files::Receive {
+        dir: p.download_dir.clone(),
+        save: files_on,
+        images: images_on,
+        print: neg.has(Feature::Print),
+    };
+    let uni = tokio::spawn(accept_uni(conn.clone(), sh.clone(), neg.has(Feature::MultiStream), downloads.clone(), receive));
+    // Bidi streams the host opens: folder requests (FS) and USB tunnels.
     let bidi = tokio::spawn({
-        let conn = conn.clone();
+        let (conn, sh) = (conn.clone(), sh.clone());
+        let usb_on = neg.has(Feature::UsbRedirect);
         async move {
-            while let Ok((_send, mut recv)) = conn.accept_bi().await {
-                let _ = recv.stop(0u32.into());
+            while let Ok((send, mut recv)) = conn.accept_bi().await {
+                let sh = sh.clone();
+                tokio::spawn(async move {
+                    match read_varint(&mut recv).await {
+                        Ok(Some(stream_type::FS)) if mount_on => {
+                            let shares = sh.shares.lock().unwrap().clone();
+                            if let Err(e) = nya_transport::folders::serve_stream(send, recv, shares).await {
+                                tracing::debug!("folder request: {e:#}");
+                            }
+                        }
+                        Ok(Some(stream_type::TUNNEL)) if usb_on => {
+                            let Ok(Some(port)) = read_varint(&mut recv).await else { return };
+                            if let Err(e) = crate::usb::tunnel(send, recv, port, &sh).await {
+                                tracing::debug!("usb tunnel: {e:#}");
+                            }
+                        }
+                        _ => {
+                            let _ = recv.stop(0u32.into());
+                        }
+                    }
+                });
             }
         }
     });
@@ -323,6 +372,25 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
                         });
                     }
                     Some(Msg::GamepadRumble(r)) => sh.event(Event::Rumble { index: r.index, large: r.large_motor, small: r.small_motor }),
+                    Some(Msg::FileRequest(req)) if clip_files_on => {
+                        // The host pastes files copied on the phone.
+                        let items = sh.clip_out.lock().unwrap().items(req.transfer_id);
+                        match items {
+                            Some(items) => {
+                                tracing::info!("host pastes our files (offer {:016x})", req.transfer_id);
+                                tokio::spawn(crate::files::send_clipboard(conn.clone(), req.transfer_id, items, sh.clone()));
+                            }
+                            None => {
+                                let r = pb::FileResult { transfer_id: req.transfer_id, ok: false, message: "这批文件已过期，请在手机上重新复制".into(), saved_to: String::new() };
+                                let _ = write_msg(&mut send, &ctl(Msg::FileResult(r))).await;
+                            }
+                        }
+                    }
+                    Some(Msg::FolderMountStatus(s)) => sh.event(Event::FolderMount { mounted: s.mounted, mount_point: s.mount_point, message: s.message }),
+                    Some(Msg::UsbStatus(u)) => {
+                        crate::usb::status(&sh, &u);
+                        sh.event(Event::UsbStatus { busid: u.busid, attached: u.attached, message: u.message });
+                    }
                     Some(Msg::Bye(b)) => break End::Fatal(format!("被控端断开：{}", b.reason)),
                     Some(other) => tracing::debug!("ignoring {other:?}"),
                     None => tracing::debug!("ignoring unknown control message"),
@@ -351,6 +419,40 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
                             id: String::new(), upload: true, name: String::new(), done: 0, total: 0,
                             finished: true, ok: false, message: "电脑上的被控端版本不支持文件传输，请升级被控端".into(),
                         });
+                    }
+                }
+                Some(NetCmd::Mic(d)) => {
+                    if mic_on {
+                        let _ = conn.send_datagram(d.into());
+                    }
+                }
+                Some(NetCmd::SendImage(dib)) => {
+                    if images_on {
+                        tokio::spawn(crate::files::send_image(conn.clone(), dib));
+                    }
+                }
+                Some(NetCmd::OfferFiles(paths)) => {
+                    let offer = if clip_files_on { sh.clip_out.lock().unwrap().offer(&paths, true) } else { None };
+                    match offer {
+                        Some(o) => {
+                            tracing::info!("offering {} copied item(s) to the host", o.files.len());
+                            if let Err(e) = write_msg(&mut send, &ctl(Msg::FileOffer(o))).await {
+                                break End::Lost(format!("control: {e}"));
+                            }
+                        }
+                        None => sh.event(Event::Transfer {
+                            id: String::new(), upload: true, name: String::new(), done: 0, total: 0, finished: true, ok: false,
+                            message: if clip_files_on { "没有可复制的文件".into() } else { "电脑上的被控端版本不支持复制文件".into() },
+                        }),
+                    }
+                }
+                Some(NetCmd::SetShares(s)) => {
+                    let s = Arc::new(s);
+                    *sh.shares.lock().unwrap() = s.clone();
+                    if mount_on {
+                        if let Err(e) = write_msg(&mut send, &ctl(Msg::SharedFolders(s.to_pb()))).await {
+                            break End::Lost(format!("control: {e}"));
+                        }
                     }
                 }
                 Some(NetCmd::Quit) | None => {
@@ -384,13 +486,13 @@ async fn accept_uni(
     sh: Arc<Shared>,
     multi: bool,
     downloads: Arc<crate::files::Downloads>,
-    download_dir: Option<std::path::PathBuf>,
+    receive: crate::files::Receive,
 ) {
     while let Ok(mut r) = conn.accept_uni().await {
-        let (sh, downloads, download_dir) = (sh.clone(), downloads.clone(), download_dir.clone());
+        let (sh, downloads, receive) = (sh.clone(), downloads.clone(), receive.clone());
         tokio::spawn(async move {
             match read_varint(&mut r).await {
-                Ok(Some(stream_type::FILE)) => crate::files::receive(r, sh, downloads, download_dir).await,
+                Ok(Some(stream_type::FILE)) => crate::files::receive(r, sh, downloads, receive).await,
                 Ok(Some(stream_type::VIDEO)) => {
                     let Ok(Some(stream_id)) = read_varint(&mut r).await else { return };
                     // With FEATURE_MULTI_STREAM the prelude names the window (slot).
@@ -474,7 +576,8 @@ mod tests {
         let v = local_version();
         assert!(v.has(Feature::VirtualDisplay) && v.has(Feature::VideoDatagram) && v.has(Feature::Audio));
         assert!(v.has(Feature::TextInput) && v.has(Feature::FileTransfer) && v.has(Feature::Gamepad));
-        for f in [Feature::UsbRedirect, Feature::FolderMount, Feature::Print, Feature::Hdr, Feature::Yuv444, Feature::ClipboardFiles] {
+        assert!(v.has(Feature::FolderMount) && v.has(Feature::Print) && v.has(Feature::Microphone) && v.has(Feature::UsbRedirect));
+        for f in [Feature::Yuv444] {
             assert!(!v.has(f), "{f:?} must not be offered");
         }
         assert_eq!(v.major, nya_proto::PROTO_MAJOR);

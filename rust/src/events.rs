@@ -21,6 +21,13 @@ pub enum Event {
         text_input: bool,
         file_transfer: bool,
         gamepad: bool,
+        clipboard_image: bool,
+        clipboard_files: bool,
+        microphone: bool,
+        folder_mount: bool,
+        print: bool,
+        usb: bool,
+        hdr: bool,
     },
     Reconnecting {
         message: String,
@@ -33,6 +40,9 @@ pub enum Event {
         host_name: String,
         virtual_display_available: bool,
         displays: Vec<Display>,
+        /// Playback device on the host that receives the microphone; empty = none installed.
+        mic_device: String,
+        usb_available: bool,
     },
     StreamStarted {
         width: u32,
@@ -43,6 +53,8 @@ pub enum Event {
         codec: String,
         encoder: String,
         display_id: u32,
+        /// HDR10 (HEVC Main10, BT.2020, PQ).
+        hdr: bool,
     },
     StreamError {
         message: String,
@@ -92,6 +104,24 @@ pub enum Event {
     FilesReceived {
         id: String,
         paths: Vec<String>,
+    },
+    /// An image copied on the host: CF_DIB bytes in this file.
+    ClipboardImage {
+        path: String,
+    },
+    /// The host printed: a PDF to print or open here.
+    PrintJob {
+        path: String,
+    },
+    FolderMount {
+        mounted: bool,
+        mount_point: String,
+        message: String,
+    },
+    UsbStatus {
+        busid: String,
+        attached: bool,
+        message: String,
     },
     /// Force feedback for pad `index` (0..255 per motor).
     Rumble {
@@ -158,6 +188,8 @@ impl Event {
         Event::SessionInfo {
             host_name: i.host_name.clone(),
             virtual_display_available: i.virtual_display_available,
+            mic_device: i.mic_device.clone(),
+            usb_available: i.usb_available,
             displays: i
                 .displays
                 .iter()
@@ -184,6 +216,8 @@ impl Event {
             codec: codec_name(c.codec).into(),
             encoder: s.encoder_name.clone(),
             display_id: s.display_id,
+            hdr: c.hdr,
+
         }
     }
 

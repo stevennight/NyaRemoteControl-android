@@ -19,7 +19,10 @@ val coreJson = Json {
 }
 
 @Serializable
-data class DecoderCap(val codec: String, val hardware: Boolean, val maxWidth: Int = 0, val maxHeight: Int = 0)
+data class DecoderCap(val codec: String, val hardware: Boolean, val maxWidth: Int = 0, val maxHeight: Int = 0, val tenBit: Boolean = false)
+
+@Serializable
+data class ShareConfig(val name: String, val path: String, val readOnly: Boolean = false)
 
 @Serializable
 data class VirtualScreen(val width: Int, val height: Int, val refreshHz: Int = 60, val scalePercent: Int = 0)
@@ -32,6 +35,12 @@ data class StreamOptions(
     val videoTransport: String = "auto",
     val virtualScreen: VirtualScreen? = null,
     val physicalOff: Boolean = false,
+    /** Host display to show; 0 = primary (the virtual screen while there is one). */
+    val displayId: Int = 0,
+    /** "auto" / "quality" / "balanced" / "smooth" / "fixed". */
+    val bitratePolicy: String = "auto",
+    /** Ask for HDR10 (the phone's screen shows HDR). */
+    val hdr: Boolean = false,
 )
 
 @Serializable
@@ -45,7 +54,10 @@ data class StartConfig(
     val maxFps: Int,
     val stream: StreamOptions,
     val downloadDir: String? = null,
+    val shares: List<ShareConfig> = emptyList(),
 )
+
+data class HostDisplay(val id: Int, val name: String, val width: Int, val height: Int, val primary: Boolean, val isVirtual: Boolean)
 
 data class StatsLine(
     val fps: Int,
@@ -77,10 +89,24 @@ sealed interface CoreEvent {
         val textInput: Boolean,
         val fileTransfer: Boolean,
         val gamepad: Boolean,
+        val clipboardImage: Boolean = false,
+        val clipboardFiles: Boolean = false,
+        val microphone: Boolean = false,
+        val folderMount: Boolean = false,
+        val print: Boolean = false,
+        val usb: Boolean = false,
+        val hdr: Boolean = false,
     ) : CoreEvent
     data class Reconnecting(val message: String) : CoreEvent
     data class Disconnected(val message: String) : CoreEvent
-    data class SessionInfo(val hostName: String, val virtualDisplayAvailable: Boolean) : CoreEvent
+    data class SessionInfo(
+        val hostName: String,
+        val virtualDisplayAvailable: Boolean,
+        val displays: List<HostDisplay> = emptyList(),
+        /** Host playback device for the microphone; empty = no virtual cable installed. */
+        val micDevice: String = "",
+        val usbAvailable: Boolean = false,
+    ) : CoreEvent
     data class StreamStarted(
         val width: Int,
         val height: Int,
@@ -89,6 +115,7 @@ sealed interface CoreEvent {
         val fps: Int,
         val codec: String,
         val encoder: String,
+        val hdr: Boolean = false,
     ) : CoreEvent
     data class StreamError(val message: String) : CoreEvent
     data class Role(val controlling: Boolean, val controller: String, val viewers: List<String>) : CoreEvent
@@ -109,6 +136,10 @@ sealed interface CoreEvent {
     ) : CoreEvent
     data class FilesReceived(val id: String, val paths: List<String>) : CoreEvent
     data class Rumble(val index: Int, val large: Int, val small: Int) : CoreEvent
+    data class ClipboardImage(val path: String) : CoreEvent
+    data class PrintJob(val path: String) : CoreEvent
+    data class FolderMount(val mounted: Boolean, val mountPoint: String, val message: String) : CoreEvent
+    data class UsbStatus(val busid: String, val attached: Boolean, val message: String) : CoreEvent
 
     companion object {
         /** Null for event types this build doesn't know. */
@@ -125,11 +156,25 @@ sealed interface CoreEvent {
                 "connected" -> Connected(
                     s("serverName"), s("serverVersion"), s("serverFingerprint"), s("serverFingerprintShort"),
                     b("textInput"), b("fileTransfer"), b("gamepad"),
+                    b("clipboardImage"), b("clipboardFiles"), b("microphone"), b("folderMount"), b("print"), b("usb"), b("hdr"),
                 )
                 "reconnecting" -> Reconnecting(s("message"))
                 "disconnected" -> Disconnected(s("message"))
-                "sessionInfo" -> SessionInfo(s("hostName"), b("virtualDisplayAvailable"))
-                "streamStarted" -> StreamStarted(i("width"), i("height"), i("sourceWidth"), i("sourceHeight"), i("fps"), s("codec"), s("encoder"))
+                "sessionInfo" -> SessionInfo(
+                    s("hostName"),
+                    b("virtualDisplayAvailable"),
+                    o["displays"]?.jsonArray?.map {
+                        val d = it.jsonObject
+                        fun ds(k: String) = d[k]?.jsonPrimitive?.content ?: ""
+                        fun di(k: String) = d[k]?.jsonPrimitive?.int ?: 0
+                        fun db(k: String) = d[k]?.jsonPrimitive?.boolean ?: false
+                        HostDisplay(di("id"), ds("name"), di("width"), di("height"), db("primary"), db("isVirtual"))
+                    } ?: emptyList(),
+                    s("micDevice"),
+                    b("usbAvailable"),
+                )
+                "streamStarted" -> StreamStarted(i("width"), i("height"), i("sourceWidth"), i("sourceHeight"), i("fps"), s("codec"), s("encoder"), b("hdr"))
+
                 "streamError" -> StreamError(s("message"))
                 "role" -> Role(b("controlling"), s("controller"), o["viewers"]?.jsonArray?.map { it.jsonPrimitive.content } ?: emptyList())
                 "cursorShape" -> CursorShape(i("id"), i("width"), i("height"), i("hotX"), i("hotY"), s("rgba"))
@@ -157,6 +202,11 @@ sealed interface CoreEvent {
                 "transfer" -> Transfer(s("id"), b("upload"), s("name"), l("done"), l("total"), b("finished"), b("ok"), s("message"))
                 "filesReceived" -> FilesReceived(s("id"), o["paths"]?.jsonArray?.map { it.jsonPrimitive.content } ?: emptyList())
                 "rumble" -> Rumble(i("index"), i("large"), i("small"))
+                "clipboardImage" -> ClipboardImage(s("path"))
+                "printJob" -> PrintJob(s("path"))
+                "folderMount" -> FolderMount(b("mounted"), s("mountPoint"), s("message"))
+                "usbStatus" -> UsbStatus(s("busid"), b("attached"), s("message"))
+
                 else -> null
             }
         }

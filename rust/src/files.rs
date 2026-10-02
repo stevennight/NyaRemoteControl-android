@@ -129,6 +129,39 @@ async fn send_one(conn: &Connection, header: pb::FileHeader, file: std::fs::File
     Ok(())
 }
 
+/// The host pastes files copied on the phone (FEATURE_CLIPBOARD_FILES).
+pub async fn send_clipboard(conn: Connection, id: u64, items: Vec<files::Item>, sh: Arc<Shared>) {
+    let total = items.iter().filter(|i| !i.is_dir).map(|i| i.size).sum();
+    let mut prog = Progress::new(&sh, id, true, total);
+    let res = nya_transport::clipfiles::send_items(&conn, id, &items, pb::FilePurpose::Clipboard, |name, n| {
+        if prog.name != name {
+            prog.name = name.to_owned();
+        }
+        prog.add(n);
+    })
+    .await;
+    match res {
+        Ok(()) => prog.finish(Ok(format!("已粘贴到电脑（{} 项）", items.len()))),
+        Err(e) => prog.finish(Err(format!("复制到电脑失败：{e:#}"))),
+    }
+}
+
+/// An image copied on the phone, as CF_DIB bytes.
+pub async fn send_image(conn: Connection, dib: Vec<u8>) {
+    let h = pb::FileHeader {
+        transfer_id: new_id(),
+        name: "clipboard.dib".into(),
+        size: dib.len() as u64,
+        purpose: pb::FilePurpose::ClipboardImage as i32,
+        index: 0,
+        count: 1,
+        path: String::new(),
+    };
+    if let Err(e) = files::send_bytes(&conn, h, &dib).await {
+        tracing::debug!("clipboard image: {e:#}");
+    }
+}
+
 /// Downloads in progress: offers we requested, and what arrived so far.
 #[derive(Default)]
 pub struct Downloads {
@@ -159,17 +192,61 @@ impl Downloads {
     }
 }
 
-/// A FILE stream from the host (after the type varint): a requested download.
-pub async fn receive(mut r: RecvStream, sh: Arc<Shared>, dl: Arc<Downloads>, dir: Option<PathBuf>) {
+/// What FILE streams from the host may carry (negotiated features) and where they go.
+#[derive(Clone)]
+pub struct Receive {
+    pub dir: Option<PathBuf>,
+    pub save: bool,
+    pub images: bool,
+    pub print: bool,
+}
+
+/// A FILE stream from the host (after the type varint): a requested download,
+/// an image copied on the host, or a print job.
+pub async fn receive(mut r: RecvStream, sh: Arc<Shared>, dl: Arc<Downloads>, rx: Receive) {
     let h = match files::read_header(&mut r).await {
         Ok(h) => h,
         Err(e) => return tracing::warn!("file header: {e:#}"),
     };
-    let save = pb::FilePurpose::try_from(h.purpose).unwrap_or(pb::FilePurpose::Unspecified) == pb::FilePurpose::Save;
-    let Some(dir) = dir.filter(|_| save) else {
+    let purpose = pb::FilePurpose::try_from(h.purpose).unwrap_or(pb::FilePurpose::Unspecified);
+    let Some(dir) = rx.dir.clone() else {
         let _ = r.stop(0u32.into());
         return;
     };
+    match purpose {
+        pb::FilePurpose::ClipboardImage if rx.images => {
+            match files::receive_to_vec(&mut r, &h, files::MAX_IMAGE_BYTES).await {
+                Ok(dib) => {
+                    let path = dir.join("clipboard.dib");
+                    let write = async {
+                        tokio::fs::create_dir_all(&dir).await?;
+                        tokio::fs::write(&path, &dib).await
+                    };
+                    match write.await {
+                        Ok(()) => sh.event(Event::ClipboardImage { path: path.to_string_lossy().into_owned() }),
+                        Err(e) => tracing::warn!("clipboard image: {e}"),
+                    }
+                }
+                Err(e) => tracing::debug!("clipboard image: {e:#}"),
+            }
+            return;
+        }
+        pb::FilePurpose::Print if rx.print => {
+            match files::receive_to_dir(&mut r, &h, &dir.join("print"), |_| {}).await {
+                Ok(p) => {
+                    tracing::info!("print job from the host: {}", p.display());
+                    sh.event(Event::PrintJob { path: p.to_string_lossy().into_owned() });
+                }
+                Err(e) => tracing::warn!("receiving print job {}: {e:#}", h.name),
+            }
+            return;
+        }
+        pb::FilePurpose::Save | pb::FilePurpose::Unspecified if rx.save => {}
+        _ => {
+            let _ = r.stop(0u32.into());
+            return;
+        }
+    }
     // One folder per batch: the app moves its files away when it is complete.
     let dir = dir.join(format!("{:016x}", h.transfer_id));
     let total = dl.offers.lock().unwrap().get(&h.transfer_id).copied().unwrap_or(0);

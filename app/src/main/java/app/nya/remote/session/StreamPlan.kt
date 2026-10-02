@@ -11,8 +11,17 @@ import kotlin.math.roundToInt
 /**
  * What to ask the host for, given the settings and the phone's screen
  * (physical pixels, any orientation; the session is always landscape).
+ * [hdrCapable]: the screen shows HDR10 and a decoder handles HEVC Main10.
+ * [displayId]: the host display picked in the panel (0 = primary).
  */
-fun streamOptions(s: Settings, screenWidth: Int, screenHeight: Int, refreshHz: Int): StreamOptions {
+fun streamOptions(
+    s: Settings,
+    screenWidth: Int,
+    screenHeight: Int,
+    refreshHz: Int,
+    hdrCapable: Boolean = false,
+    displayId: Int = 0,
+): StreamOptions {
     var w = max(screenWidth, screenHeight)
     var h = min(screenWidth, screenHeight)
     var scale = s.scalePercent
@@ -31,8 +40,11 @@ fun streamOptions(s: Settings, screenWidth: Int, screenHeight: Int, refreshHz: I
         codec = s.codec,
         bitrateKbps = s.bitrateKbps,
         game = s.gameMode,
-        videoTransport = "auto",
+        videoTransport = s.videoTransport,
         virtualScreen = screen,
         physicalOff = s.physicalOff && screen != null,
+        displayId = displayId,
+        bitratePolicy = s.bitratePolicy,
+        hdr = s.hdr && hdrCapable,
     )
 }

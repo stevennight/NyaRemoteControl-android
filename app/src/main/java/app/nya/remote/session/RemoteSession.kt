@@ -68,6 +68,14 @@ class RemoteSession(dataDir: String, config: StartConfig, private val onEvent: (
         onHandle { NativeCore.audioPull(it, maxFrames, deviceQueued, out) } ?: 0
     fun requestFiles(offerId: String) = onHandle { NativeCore.requestFiles(it, offerId) }
     fun sendFiles(json: String) = onHandle { NativeCore.sendFiles(it, json) }
+    fun mic(opus: ByteArray) = onHandle { NativeCore.mic(it, opus) }
+    fun clipboardImage(dib: ByteArray) = onHandle { NativeCore.clipboardImage(it, dib) }
+    fun clipboardFiles(pathsJson: String) = onHandle { NativeCore.clipboardFiles(it, pathsJson) }
+    fun setShares(json: String) = onHandle { NativeCore.setShares(it, json) }
+    fun usbShare(busid: String, devnum: Int, fd: Int, descriptors: ByteArray, description: String): Boolean =
+        onHandle { NativeCore.usbShare(it, busid, devnum, fd, descriptors, description) } ?: false
+    fun usbUnshare(busid: String) = onHandle { NativeCore.usbUnshare(it, busid) }
+
     fun updateStream(o: StreamOptions) = onHandle { NativeCore.updateStream(it, coreJson.encodeToString(StreamOptions.serializer(), o)) }
     fun setGameMode(game: Boolean) = onHandle { NativeCore.setMode(it, game) }
     fun sendSas() = onHandle { NativeCore.sendSas(it) }

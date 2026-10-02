@@ -17,11 +17,12 @@ pub mod net;
 pub mod options;
 pub mod session;
 pub mod stats;
+pub mod usb;
 
 use std::path::PathBuf;
 use std::time::Duration;
 
-use jni::objects::{JByteBuffer, JClass, JFloatArray, JLongArray, JShortArray, JString};
+use jni::objects::{JByteArray, JByteBuffer, JClass, JFloatArray, JLongArray, JShortArray, JString};
 use jni::sys::{jboolean, jfloat, jint, jlong, jstring, JNI_TRUE};
 use jni::JNIEnv;
 use nya_proto::pb::{self, control_msg::Msg, input_msg::Ev};
@@ -426,7 +427,107 @@ fn file_from_fd(_fd: i32) -> Option<std::fs::File> {
     None
 }
 
+/// One Opus packet from the phone's microphone (48 kHz stereo).
+#[no_mangle]
+pub extern "system" fn Java_app_nya_remote_core_NativeCore_mic<'l>(env: JNIEnv<'l>, _cls: JClass<'l>, h: jlong, opus: JByteArray<'l>) {
+    let Some(s) = session(h) else { return };
+    let Ok(data) = env.convert_byte_array(&opus) else { return };
+    let seq = s.mic_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let d = nya_proto::frame::AudioPacket { seq, capture_ts_us: nya_proto::now_us(), data }.encode_as(nya_proto::frame::datagram_type::MIC);
+    s.cmd(session::NetCmd::Mic(d));
+}
+
+/// An image copied on the phone, as CF_DIB bytes.
+#[no_mangle]
+pub extern "system" fn Java_app_nya_remote_core_NativeCore_clipboardImage<'l>(env: JNIEnv<'l>, _cls: JClass<'l>, h: jlong, dib: JByteArray<'l>) {
+    let Some(s) = session(h) else { return };
+    if let Ok(d) = env.convert_byte_array(&dib) {
+        s.cmd(session::NetCmd::SendImage(d));
+    }
+}
+
+/// Files copied on the phone (copies in the app's cache, JSON array of paths), offered for pasting on the host.
+#[no_mangle]
+pub extern "system" fn Java_app_nya_remote_core_NativeCore_clipboardFiles<'l>(mut env: JNIEnv<'l>, _cls: JClass<'l>, h: jlong, json: JString<'l>) {
+    let json = string(&mut env, &json).unwrap_or_default();
+    let paths: Vec<String> = serde_json::from_str(&json).unwrap_or_default();
+    if let Some(s) = session(h) {
+        s.cmd(session::NetCmd::OfferFiles(paths.into_iter().map(PathBuf::from).collect()));
+    }
+}
+
+/// New list of shared folders: `[{"name","path","readOnly"}]`.
+#[no_mangle]
+pub extern "system" fn Java_app_nya_remote_core_NativeCore_setShares<'l>(mut env: JNIEnv<'l>, _cls: JClass<'l>, h: jlong, json: JString<'l>) {
+    let json = string(&mut env, &json).unwrap_or_default();
+    match serde_json::from_str::<Vec<options::ShareConfig>>(&json) {
+        Ok(list) => {
+            if let Some(s) = session(h) {
+                s.cmd(session::NetCmd::SetShares(options::shares(&list)));
+            }
+        }
+        Err(e) => tracing::warn!("setShares: {e}"),
+    }
+}
+
+/// Share a USB device (opened and all interfaces claimed by the app) with the
+/// host: `fd` of its UsbDeviceConnection (stays owned by the app), its raw descriptors.
+#[no_mangle]
+pub extern "system" fn Java_app_nya_remote_core_NativeCore_usbShare<'l>(
+    mut env: JNIEnv<'l>,
+    _cls: JClass<'l>,
+    h: jlong,
+    busid: JString<'l>,
+    devnum: jint,
+    fd: jint,
+    descriptors: JByteArray<'l>,
+    description: JString<'l>,
+) -> jboolean {
+    let busid = string(&mut env, &busid).unwrap_or_default();
+    let description = string(&mut env, &description).unwrap_or_default();
+    let raw = env.convert_byte_array(&descriptors).unwrap_or_default();
+    let Some(s) = session(h) else { return 0 };
+    let info = match usb::DeviceInfo::parse(&raw) {
+        Ok(i) => i,
+        Err(e) => {
+            tracing::warn!("usb {busid}: {e:#}");
+            return 0;
+        }
+    };
+    let Some(backend) = usb_backend(fd) else { return 0 };
+    s.shared.usb.add(usb::Device {
+        busid: busid.clone(),
+        devnum: devnum.max(1) as u32,
+        info,
+        backend,
+        closed: std::sync::atomic::AtomicBool::new(false),
+    });
+    s.control(Msg::UsbAttach(pb::UsbAttach { busid, description }));
+    JNI_TRUE
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn usb_backend(fd: i32) -> Option<std::sync::Arc<dyn usb::Backend>> {
+    Some(std::sync::Arc::new(usb::devfs::DevFs::new(fd)))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn usb_backend(_fd: i32) -> Option<std::sync::Arc<dyn usb::Backend>> {
+    None
+}
+
+/// Stop sharing a USB device (the app closes its connection afterwards).
+#[no_mangle]
+pub extern "system" fn Java_app_nya_remote_core_NativeCore_usbUnshare<'l>(mut env: JNIEnv<'l>, _cls: JClass<'l>, h: jlong, busid: JString<'l>) {
+    let busid = string(&mut env, &busid).unwrap_or_default();
+    if let Some(s) = session(h) {
+        s.control(Msg::UsbDetach(pb::UsbDetach { busid: busid.clone() }));
+        s.shared.usb.remove(&busid);
+    }
+}
+
 /// Disconnect; a Disconnected event follows.
+
 #[no_mangle]
 pub extern "system" fn Java_app_nya_remote_core_NativeCore_stop(_env: JNIEnv, _cls: JClass, h: jlong) {
     if let Some(s) = session(h) {

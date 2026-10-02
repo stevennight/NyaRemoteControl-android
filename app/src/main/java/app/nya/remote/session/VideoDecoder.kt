@@ -1,6 +1,8 @@
 package app.nya.remote.session
 
 import android.media.MediaCodec
+import android.media.MediaCodecInfo
+
 import android.media.MediaFormat
 import android.os.Build
 import android.util.Log
@@ -28,7 +30,12 @@ class VideoDecoder(
     private var running = true
     private val input = thread(start = false, name = "nya-video-in") { feed() }
 
+    /** The stream is HDR10 (from StreamStarted): the decoder is set up for BT.2020 / PQ. */
+    @Volatile
+    var hdr = false
+
     private var codec: MediaCodec? = null
+    private var configuredHdr = false
     private var output: Thread? = null
 
     @Volatile
@@ -76,7 +83,7 @@ class VideoDecoder(
                 val m = DecoderCaps.mimeFor(meta[6]) ?: continue
                 val w = meta[4].toInt()
                 val h = meta[5].toInt()
-                if (codec == null || m != mime || w != width || h != height) {
+                if (codec == null || m != mime || w != width || h != height || configuredHdr != hdr) {
                     if (!key) {
                         session.requestKeyframe()
                         continue
@@ -127,6 +134,13 @@ class VideoDecoder(
         MediaFormat.createVideoFormat(m, w, h).apply {
             setInteger(MediaFormat.KEY_PRIORITY, 0) // realtime
             if (Build.VERSION.SDK_INT >= 30) setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+            if (hdr && m == "video/hevc") {
+                // HDR10: the surface gets BT.2020 PQ buffers; the system shows them in HDR.
+                setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10HDR10)
+                setInteger(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.COLOR_STANDARD_BT2020)
+                setInteger(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_ST2084)
+                setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_LIMITED)
+            }
             if (lowLatencyExtras) {
                 // Vendor switches for decoders that hold frames back otherwise; unknown keys are ignored.
                 setInteger("vendor.qti-ext-dec-low-latency.enable", 1)
@@ -152,6 +166,7 @@ class VideoDecoder(
                 c.setVideoScalingMode(MediaCodec.VIDEO_SCALING_MODE_SCALE_TO_FIT)
                 c.start()
                 codec = c
+                configuredHdr = hdr
                 mime = m
                 width = w
                 height = h

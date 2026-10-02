@@ -14,7 +14,47 @@ class InputFeaturesTest {
     private val keys = KeyboardController(
         send = { k, down -> log += "%02x%s".format(k.code, if (down) "v" else "^") },
         sendText = { log += "text:$it" },
+        paste = { log += "paste:$it" },
     )
+
+    @Test
+    fun chineseOnAnOldHostGoesThroughItsClipboard() {
+        keys.textInput = false
+        keys.type("你好")
+        assertEquals(listOf("paste:你好"), log)
+    }
+
+    @Test
+    fun asciiWordOnAnOldHostIsTypedAsKeys() {
+        keys.textInput = false
+        keys.type("ok")
+        assertEquals(listOf("18v", "18^", "25v", "25^"), log)
+    }
+
+    @Test
+    fun dibRoundTrip() {
+        val px = app.nya.remote.data.Dib.Pixels(2, 2, intArrayOf(0xffff0000.toInt(), 0xff00ff00.toInt(), 0xff0000ff.toInt(), 0x80123456.toInt()))
+        val back = app.nya.remote.data.Dib.decode(app.nya.remote.data.Dib.encode(px))!!
+        assertEquals(2, back.width)
+        assertEquals(px.argb.toList(), back.argb.toList())
+    }
+
+    @Test
+    fun opaqueDibWithZeroAlpha() {
+        val dib = app.nya.remote.data.Dib.encode(app.nya.remote.data.Dib.Pixels(1, 1, intArrayOf(0x00102030)))
+        assertEquals(0xff102030.toInt(), app.nya.remote.data.Dib.decode(dib)!!.argb[0])
+    }
+
+    @Test
+    fun versionOrder() {
+        val u = app.nya.remote.data.Updater
+        assertEquals(true, u.newer("0.2.0", "0.1.9"))
+        assertEquals(false, u.newer("0.1.0", "0.1.0"))
+        assertEquals(true, u.newer("0.2.0", "0.2.0-beta.1"))
+        assertEquals(false, u.newer("0.2.0-beta.1", "0.2.0"))
+        assertEquals(true, u.newer("1.0.0", "0.10.3"))
+    }
+
 
     @Test
     fun textModeSendsUnicodeAndKeepsLineBreaksAsKeys() {

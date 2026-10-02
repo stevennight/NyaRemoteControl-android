@@ -26,6 +26,30 @@ pub struct StartConfig {
     /// Where files from the host are received (the app then moves them to Downloads).
     #[serde(default)]
     pub download_dir: Option<String>,
+    /// Phone folders shown on the host as a drive (FEATURE_FOLDER_MOUNT).
+    #[serde(default)]
+    pub shares: Vec<ShareConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareConfig {
+    pub name: String,
+    pub path: String,
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+pub fn shares(list: &[ShareConfig]) -> nya_transport::folders::Shares {
+    nya_transport::folders::Shares(
+        list.iter()
+            .map(|s| nya_transport::folders::Share {
+                name: s.name.clone(),
+                root: std::path::PathBuf::from(&s.path),
+                read_only: s.read_only,
+            })
+            .collect(),
+    )
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -39,6 +63,9 @@ pub struct DecoderCap {
     pub max_width: u32,
     #[serde(default)]
     pub max_height: u32,
+    /// 10-bit 4:2:0 (HEVC Main10) for HDR10.
+    #[serde(default)]
+    pub ten_bit: bool,
 }
 
 /// What the client asks the host to stream. Sent again to change it.
@@ -63,6 +90,15 @@ pub struct StreamOptions {
     /// Switch the host's physical displays off while connected (privacy).
     #[serde(default)]
     pub physical_off: bool,
+    /// Host display to show; 0 = primary (the virtual screen while there is one).
+    #[serde(default)]
+    pub display_id: u32,
+    /// "auto" / "quality" / "balanced" / "smooth" / "fixed".
+    #[serde(default)]
+    pub bitrate_policy: String,
+    /// The phone shows HDR: ask for HDR10 (FEATURE_HDR).
+    #[serde(default)]
+    pub hdr: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -109,7 +145,7 @@ impl StreamOptions {
         });
         pb::StartStream {
             // 0 = primary, which is the virtual screen while there is one.
-            display_id: 0,
+            display_id: self.display_id,
             display_setup: setup,
             slot: 0,
             config: Some(pb::StreamConfig {
@@ -120,13 +156,19 @@ impl StreamOptions {
                 fps: 0,
                 bitrate_kbps: self.bitrate_kbps,
                 mode: if self.game { pb::StreamMode::Game } else { pb::StreamMode::Office } as i32,
-                bitrate_policy: pb::BitratePolicy::Unspecified as i32,
+                bitrate_policy: match self.bitrate_policy.as_str() {
+                    "quality" => pb::BitratePolicy::Quality,
+                    "balanced" => pb::BitratePolicy::Balanced,
+                    "smooth" => pb::BitratePolicy::Smooth,
+                    "fixed" => pb::BitratePolicy::Fixed,
+                    _ => pb::BitratePolicy::Unspecified,
+                } as i32,
                 video_transport: match self.video_transport.as_str() {
                     "stream" => pb::VideoTransport::Stream,
                     "datagram" => pb::VideoTransport::Datagram,
                     _ => pb::VideoTransport::Auto,
                 } as i32,
-                hdr: false,
+                hdr: self.hdr,
             }),
             encoder_preference: String::new(),
         }
@@ -146,7 +188,7 @@ impl StartConfig {
                     max_width: d.max_width,
                     max_height: d.max_height,
                     hardware: d.hardware,
-                    ten_bit: false,
+                    ten_bit: d.ten_bit,
                 })
             })
             .collect();

@@ -119,6 +119,14 @@ async fn fake_host(endpoint: nya_transport::quinn::Endpoint, id: Identity, key: 
         })
     };
 
+    // The phone's shared folder, read through an FS stream like the mounted drive does.
+    let read = pb::FsRequest { path: "/phone/note.txt".into(), op: Some(pb::fs_request::Op::Read(pb::FsRead { offset: 0, len: 100 })) };
+    let reply = nya_transport::folders::call(&conn, &read).await.unwrap();
+    assert_eq!(reply.data, b"shared from the phone");
+    let write = pb::FsRequest { path: "/phone/new.txt".into(), op: Some(pb::fs_request::Op::Create(pb::FsCreate { dir: false, exclusive: true })) };
+    let reply = nya_transport::folders::call(&conn, &write).await.unwrap();
+    assert_eq!(reply.error, pb::FsError::FsAccess as i32, "read-only share refuses changes");
+
     // Files copied on the host.
     let offer = pb::FileOffer {
         transfer_id: u64::MAX - 5, // above 2^53: must survive JSON as a string
@@ -201,6 +209,9 @@ fn pairs_streams_and_resyncs_on_gaps() {
     let host = rt.spawn(fake_host(endpoint, host_id.clone(), key.clone()));
 
     let dir = std::env::temp_dir().join(format!("nya-android-test-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("share")).unwrap();
+    std::fs::write(dir.join("share").join("note.txt"), b"shared from the phone").unwrap();
+
     let cfg = StartConfig {
         address: addr.to_string(),
         pinned: None,
@@ -215,6 +226,11 @@ fn pairs_streams_and_resyncs_on_gaps() {
             ..Default::default()
         },
         download_dir: Some(dir.join("received").to_string_lossy().into_owned()),
+        shares: vec![nya_android::options::ShareConfig {
+            name: "phone".into(),
+            path: dir.join("share").to_string_lossy().into_owned(),
+            read_only: true,
+        }],
     };
     let session = Session::start(&dir, cfg).unwrap();
 

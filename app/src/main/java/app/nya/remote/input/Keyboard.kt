@@ -12,21 +12,25 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 
 /**
- * Keys to the host, with sticky modifiers from the extra-keys bar: tap Ctrl,
- * then C, and the host gets Ctrl+C.
+ * Keys and text to the host, with sticky modifiers from the extra-keys bar:
+ * tap Ctrl, then C, and the host gets Ctrl+C.
  *
- * Typed text goes as Unicode ([sendText]) when the host supports it (protocol
- * 1.5), so any phone keyboard and language works; otherwise as US-layout keys.
+ * Text the phone's IME commits (any language) goes, in order of preference:
+ * as Unicode text ([sendText], protocol 1.5 hosts); as keys when a US keyboard
+ * can type all of it; otherwise through the host clipboard and Ctrl+V
+ * ([paste], works with every host version).
  */
-class KeyboardController(private val send: (ScanKey, Boolean) -> Unit, private val sendText: (String) -> Unit = {}) {
+class KeyboardController(
+    private val send: (ScanKey, Boolean) -> Unit,
+    private val sendText: (String) -> Unit = {},
+    private val paste: (String) -> Unit = {},
+) {
     /** The host types Unicode text (TEXT_INPUT negotiated). */
     var textInput = false
+
     /** Modifiers latched for the next key. */
     var sticky by mutableStateOf(emptySet<ScanKey>())
         private set
-
-    /** Characters the host keyboard can't type (shown as a hint once). */
-    var onUntypable: ((Char) -> Unit)? = null
 
     fun toggleSticky(k: ScanKey) {
         sticky = if (k in sticky) sticky - k else sticky + k
@@ -50,27 +54,32 @@ class KeyboardController(private val send: (ScanKey, Boolean) -> Unit, private v
     }
 
     fun type(text: CharSequence) {
-        if (textInput && sticky.isEmpty()) {
-            // Line breaks and tabs are keys to applications; the rest is text.
-            val run = StringBuilder()
-            fun flush() {
-                if (run.isNotEmpty()) sendText(run.toString())
-                run.clear()
+        if (text.isEmpty()) return
+        val typable = text.all { KeyMap.stroke(it) != null }
+        when {
+            // Shortcuts (a latched modifier) and single ASCII keys go as key presses.
+            sticky.isNotEmpty() || (typable && (!textInput || text.length == 1)) -> {
+                for (c in text) KeyMap.stroke(c)?.let { tap(it.key, it.shift) }
             }
-            for (c in text) {
-                when (c) {
-                    '\n' -> { flush(); tap(KeyMap.ENTER) }
-                    '\t' -> { flush(); tap(KeyMap.TAB) }
-                    '\r' -> {}
-                    else -> run.append(c)
+            textInput -> {
+                // Line breaks and tabs are keys to applications; the rest is text.
+                val run = StringBuilder()
+                fun flush() {
+                    if (run.isNotEmpty()) sendText(run.toString())
+                    run.clear()
                 }
+                for (c in text) {
+                    when (c) {
+                        '\n' -> { flush(); tap(KeyMap.ENTER) }
+                        '\t' -> { flush(); tap(KeyMap.TAB) }
+                        '\r' -> {}
+                        else -> run.append(c)
+                    }
+                }
+                flush()
             }
-            flush()
-            return
-        }
-        for (c in text) {
-            val s = KeyMap.stroke(c)
-            if (s == null) onUntypable?.invoke(c) else tap(s.key, s.shift)
+            // Chinese etc. on a host without text input: through its clipboard.
+            else -> paste(text.toString())
         }
     }
 
@@ -82,8 +91,9 @@ class KeyboardController(private val send: (ScanKey, Boolean) -> Unit, private v
 }
 
 /**
- * An invisible editor the soft keyboard types into. Asks for a plain
- * (password-like) keyboard without suggestions so keys arrive one by one.
+ * An invisible editor the soft keyboard types into. A normal text field to
+ * the IME, so its own languages (pinyin, handwriting, voice) work; only the
+ * committed result goes to the host, the composition stays in the IME.
  */
 class RemoteKeyboardView(context: Context, private val keys: KeyboardController) : View(context) {
     init {
@@ -94,54 +104,41 @@ class RemoteKeyboardView(context: Context, private val keys: KeyboardController)
     override fun onCheckIsTextEditor() = true
 
     override fun onCreateInputConnection(outAttrs: EditorInfo): InputConnection {
-        // With Unicode text the phone's own keyboard and IME (Chinese, suggestions) work as usual;
-        // without it, a plain keyboard sends keys one by one.
-        outAttrs.inputType = if (keys.textInput) {
-            InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
-        } else {
-            InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
-        }
-        outAttrs.imeOptions = EditorInfo.IME_FLAG_NO_EXTRACT_UI or EditorInfo.IME_FLAG_NO_FULLSCREEN or
-            EditorInfo.IME_ACTION_NONE
+        outAttrs.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+        outAttrs.imeOptions = EditorInfo.IME_FLAG_NO_EXTRACT_UI or EditorInfo.IME_FLAG_NO_FULLSCREEN or EditorInfo.IME_ACTION_NONE
+        outAttrs.initialSelStart = PADDING.length
+        outAttrs.initialSelEnd = PADDING.length
         return Connection()
     }
 
     private inner class Connection : BaseInputConnection(this, false) {
         private var composing = ""
 
-        // Text mode: the composition (pinyin, a word being typed) stays in the
-        // IME and only the result is sent. Key mode: IMEs that compose anyway
-        // are mirrored on the host with backspaces, so only final text stays.
+        // Some IMEs send backspace only when they believe there is text before
+        // the cursor: pretend there is (the host's text is unknown here).
+        override fun getTextBeforeCursor(length: Int, flags: Int): CharSequence = PADDING.takeLast(length.coerceAtLeast(0))
+
+        override fun getTextAfterCursor(length: Int, flags: Int): CharSequence = ""
+
+        override fun commitText(text: CharSequence, newCursorPosition: Int): Boolean {
+            composing = ""
+            keys.type(text)
+            return true
+        }
+
         override fun setComposingText(text: CharSequence, newCursorPosition: Int): Boolean {
-            if (keys.textInput) composing = text.toString() else replaceComposing(text.toString())
+            composing = text.toString()
             return true
         }
 
         override fun finishComposingText(): Boolean {
-            if (keys.textInput && composing.isNotEmpty()) keys.type(composing)
+            if (composing.isNotEmpty()) keys.type(composing)
             composing = ""
             return true
         }
 
-        override fun commitText(text: CharSequence, newCursorPosition: Int): Boolean {
-            if (keys.textInput) {
-                composing = ""
-                keys.type(text)
-            } else {
-                replaceComposing("")
-                keys.type(text)
-            }
-            return true
-        }
-
-        private fun replaceComposing(now: String) {
-            val common = composing.commonPrefixWith(now).length
-            repeat(composing.length - common) { keys.tap(KeyMap.BACKSPACE) }
-            keys.type(now.substring(common))
-            composing = now
-        }
-
         override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean {
+            if (composing.isNotEmpty()) return true // the IME edits its own composition
             repeat(beforeLength.coerceAtMost(64)) { keys.tap(KeyMap.BACKSPACE) }
             repeat(afterLength.coerceAtMost(64)) { keys.tap(KeyMap.DELETE) }
             return true
@@ -164,5 +161,9 @@ class RemoteKeyboardView(context: Context, private val keys: KeyboardController)
             keys.tap(KeyMap.ENTER)
             return true
         }
+    }
+
+    private companion object {
+        const val PADDING = "                                "
     }
 }

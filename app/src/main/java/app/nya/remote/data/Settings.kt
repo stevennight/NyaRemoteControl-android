@@ -3,6 +3,9 @@ package app.nya.remote.data
 import android.content.Context
 import android.content.SharedPreferences
 import androidx.core.content.edit
+import app.nya.remote.core.ShareConfig
+import kotlinx.serialization.json.Json
+
 
 enum class ControlMode { TOUCH, MOUSE }
 
@@ -33,6 +36,16 @@ data class Settings(
     val showStats: Boolean = false,
     /** Host clipboard text goes to the phone's clipboard. */
     val syncClipboard: Boolean = true,
+    /** "auto" / "stream" / "datagram". */
+    val videoTransport: String = "auto",
+    /** "auto" / "quality" / "balanced" / "smooth" / "fixed". */
+    val bitratePolicy: String = "auto",
+    /** HDR10 when the phone's screen, its decoder and the host can. */
+    val hdr: Boolean = true,
+    /** Microphone on at connect (remembered from the panel). */
+    val mic: Boolean = false,
+    /** Phone folders shown on the host as a drive. */
+    val shares: List<ShareConfig> = emptyList(),
 )
 
 class SettingsStore(private val prefs: SharedPreferences) {
@@ -53,6 +66,17 @@ class SettingsStore(private val prefs: SharedPreferences) {
             showGuideOnConnect = prefs.getBoolean("showGuideOnConnect", d.showGuideOnConnect),
             showStats = prefs.getBoolean("showStats", d.showStats),
             syncClipboard = prefs.getBoolean("syncClipboard", d.syncClipboard),
+            videoTransport = prefs.getString("videoTransport", d.videoTransport) ?: d.videoTransport,
+            bitratePolicy = prefs.getString("bitratePolicy", d.bitratePolicy) ?: d.bitratePolicy,
+            hdr = prefs.getBoolean("hdr", d.hdr),
+            mic = prefs.getBoolean("mic", d.mic),
+            shares = prefs.getString("shares", null)?.let {
+                try {
+                    Json.decodeFromString<List<ShareConfig>>(it)
+                } catch (_: Exception) {
+                    null
+                }
+            } ?: d.shares,
         )
     }
 
@@ -70,6 +94,11 @@ class SettingsStore(private val prefs: SharedPreferences) {
             putBoolean("showGuideOnConnect", s.showGuideOnConnect)
             putBoolean("showStats", s.showStats)
             putBoolean("syncClipboard", s.syncClipboard)
+            putString("videoTransport", s.videoTransport)
+            putString("bitratePolicy", s.bitratePolicy)
+            putBoolean("hdr", s.hdr)
+            putBoolean("mic", s.mic)
+            putString("shares", Json.encodeToString(s.shares))
         }
     }
 
