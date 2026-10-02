@@ -82,19 +82,26 @@ if ($SetGitHubSecrets) {
         ANDROID_KEY_ALIAS         = $v['ANDROID_KEY_ALIAS']
         ANDROID_KEY_PASSWORD      = $v['ANDROID_KEY_PASSWORD']
     }
-    foreach ($name in $secrets.Keys) {
-        # Values go through stdin, not the command line. GitHub sometimes answers 5xx: retry.
-        $ok = $false
-        foreach ($attempt in 1..4) {
-            $ErrorActionPreference = 'Continue'
-            $secrets[$name] | & $gh.Source secret set $name --repo $Repo 2>&1 | Out-Null
-            $ErrorActionPreference = 'Stop'
-            if ($LASTEXITCODE -eq 0) { $ok = $true; break }
-            Start-Sleep -Seconds ([math]::Pow(2, $attempt))
+    # Values go through stdin from a file, not the command line, and exactly as
+    # they are: piping a string to a program in PowerShell appends CR LF, which
+    # broke the base64 keystore. GitHub sometimes answers 5xx: retry.
+    $tmp = Join-Path ([IO.Path]::GetTempPath()) "nya-secret-$PID.txt"
+    try {
+        foreach ($name in $secrets.Keys) {
+            [IO.File]::WriteAllText($tmp, $secrets[$name].Trim())
+            $ok = $false
+            foreach ($attempt in 1..4) {
+                cmd /c "`"$($gh.Source)`" secret set $name --repo $Repo < `"$tmp`"" 2>&1 | Out-Null
+                if ($LASTEXITCODE -eq 0) { $ok = $true; break }
+                Start-Sleep -Seconds ([math]::Pow(2, $attempt))
+            }
+            if (-not $ok) { throw "could not set secret $name on $Repo" }
+            Write-Host "  $name set"
         }
-        if (-not $ok) { throw "could not set secret $name on $Repo" }
-        Write-Host "  $name set"
+    } finally {
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
     }
+
     Write-Host "Actions secrets set on $Repo" -ForegroundColor Green
 }
 
