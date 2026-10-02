@@ -29,6 +29,11 @@ pub struct StartConfig {
     /// Phone folders shown on the host as a drive (FEATURE_FOLDER_MOUNT).
     #[serde(default)]
     pub shares: Vec<ShareConfig>,
+    /// Connect without the saved pin (the host's certificate changed). If the
+    /// host already knows this phone (no pairing code proves who it is), the
+    /// fingerprint is shown for confirmation first (`verifyFingerprint`).
+    #[serde(default)]
+    pub reverify: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -83,13 +88,22 @@ pub struct StreamOptions {
     /// "auto" / "stream" / "datagram".
     #[serde(default)]
     pub video_transport: String,
-    /// A virtual screen on the host sized for the phone; `None` = the host's
+    /// The size of the virtual screens on the host; `None` = the host's
     /// displays as they are.
     #[serde(default)]
     pub virtual_screen: Option<VirtualScreen>,
+    /// How many virtual screens (1..=4) of that size; 0 counts as 1.
+    #[serde(default)]
+    pub virtual_count: u32,
     /// Switch the host's physical displays off while connected (privacy).
     #[serde(default)]
     pub physical_off: bool,
+    /// Block the host's own keyboard and mouse while connected.
+    #[serde(default)]
+    pub block_input: bool,
+    /// Host encoder: "auto" / "nvenc" / "qsv" / "amf" / "software".
+    #[serde(default)]
+    pub encoder: String,
     /// Host display to show; 0 = primary (the virtual screen while there is one).
     #[serde(default)]
     pub display_id: u32,
@@ -130,18 +144,25 @@ fn vd_dims(w: u32, h: u32) -> (u32, u32) {
 
 impl StreamOptions {
     pub fn to_start(&self) -> pb::StartStream {
-        let setup = self.virtual_screen.as_ref().map(|v| {
-            let (width, height) = vd_dims(v.width, v.height);
-            pb::DisplaySetup {
-                virtual_screens: vec![pb::VirtualScreen {
+        let screens: Vec<pb::VirtualScreen> = self
+            .virtual_screen
+            .as_ref()
+            .map(|v| {
+                let (width, height) = vd_dims(v.width, v.height);
+                let screen = pb::VirtualScreen {
                     width,
                     height,
                     refresh_hz: if v.refresh_hz == 0 { 60 } else { v.refresh_hz },
                     scale_percent: v.scale_percent,
-                }],
-                physical_off: self.physical_off,
-                block_local_input: false,
-            }
+                };
+                vec![screen; self.virtual_count.clamp(1, 4) as usize]
+            })
+            .unwrap_or_default();
+        // Same rule as the Windows client: a setup only with virtual screens or blocked input.
+        let setup = (!screens.is_empty() || self.block_input).then(|| pb::DisplaySetup {
+            physical_off: self.physical_off && !screens.is_empty(),
+            virtual_screens: screens,
+            block_local_input: self.block_input,
         });
         pb::StartStream {
             // 0 = primary, which is the virtual screen while there is one.
@@ -170,7 +191,10 @@ impl StreamOptions {
                 } as i32,
                 hdr: self.hdr,
             }),
-            encoder_preference: String::new(),
+            encoder_preference: match self.encoder.as_str() {
+                "" | "auto" => String::new(),
+                e => e.to_owned(),
+            },
         }
     }
 }
@@ -224,5 +248,21 @@ mod tests {
         let s = StreamOptions { game: true, ..Default::default() }.to_start();
         assert!(s.display_setup.is_none());
         assert_eq!(s.config.unwrap().mode, pb::StreamMode::Game as i32);
+    }
+
+    #[test]
+    fn several_virtual_screens_privacy_and_encoder() {
+        let json = r#"{"virtualScreen": {"width": 1920, "height": 1080}, "virtualCount": 3,
+            "physicalOff": true, "blockInput": true, "encoder": "qsv"}"#;
+        let s = serde_json::from_str::<StreamOptions>(json).unwrap().to_start();
+        let setup = s.display_setup.unwrap();
+        assert_eq!(setup.virtual_screens.len(), 3);
+        assert!(setup.physical_off && setup.block_local_input);
+        assert_eq!(s.encoder_preference, "qsv");
+        // Blocking input alone still needs a setup; the physical screens stay on.
+        let s = StreamOptions { block_input: true, physical_off: true, encoder: "auto".into(), ..Default::default() }.to_start();
+        let setup = s.display_setup.unwrap();
+        assert!(setup.virtual_screens.is_empty() && !setup.physical_off && setup.block_local_input);
+        assert_eq!(s.encoder_preference, "");
     }
 }

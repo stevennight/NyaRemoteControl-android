@@ -20,7 +20,7 @@ import java.security.MessageDigest
 object Updater {
     const val REPO = "stevennight/NyaRemoteControl-android"
 
-    data class Release(val version: String, val apkUrl: String, val sha256Url: String?, val notes: String)
+    data class Release(val version: String, val apkUrl: String, val sha256Url: String?, val notes: String, val page: String = "")
 
     /** Latest non-prerelease, or null (offline, none yet). Blocking: call off the main thread. */
     fun latest(): Release? {
@@ -36,7 +36,13 @@ object Updater {
             fun url(suffix: String) = assets.firstOrNull { it["name"]?.jsonPrimitive?.content?.endsWith(suffix) == true }
                 ?.get("browser_download_url")?.jsonPrimitive?.content
             val apk = url(".apk") ?: return null
-            return Release(tag.removePrefix("v"), apk, url(".apk.sha256"), o["body"]?.jsonPrimitive?.content ?: "")
+            return Release(
+                tag.removePrefix("v"),
+                apk,
+                url(".apk.sha256"),
+                o["body"]?.jsonPrimitive?.content ?: "",
+                o["html_url"]?.jsonPrimitive?.content ?: "",
+            )
         } finally {
             c.disconnect()
         }

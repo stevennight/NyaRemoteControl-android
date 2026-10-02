@@ -34,7 +34,13 @@ data class StreamOptions(
     val game: Boolean = false,
     val videoTransport: String = "auto",
     val virtualScreen: VirtualScreen? = null,
+    /** Virtual screens of that size (1..4). */
+    val virtualCount: Int = 1,
     val physicalOff: Boolean = false,
+    /** Block the host's own keyboard and mouse. */
+    val blockInput: Boolean = false,
+    /** Host encoder: "auto" / "nvenc" / "qsv" / "amf" / "software". */
+    val encoder: String = "auto",
     /** Host display to show; 0 = primary (the virtual screen while there is one). */
     val displayId: Int = 0,
     /** "auto" / "quality" / "balanced" / "smooth" / "fixed". */
@@ -55,9 +61,22 @@ data class StartConfig(
     val stream: StreamOptions,
     val downloadDir: String? = null,
     val shares: List<ShareConfig> = emptyList(),
+    /** Connect without the saved pin; the fingerprint is confirmed by the user. */
+    val reverify: Boolean = false,
 )
 
-data class HostDisplay(val id: Int, val name: String, val width: Int, val height: Int, val primary: Boolean, val isVirtual: Boolean)
+data class HostDisplay(
+    val id: Int,
+    val name: String,
+    val width: Int,
+    val height: Int,
+    val primary: Boolean,
+    val isVirtual: Boolean,
+    val hdr: Boolean = false,
+    val refreshHz: Int = 0,
+    /** 1-based among the session's virtual screens; 0 = physical. */
+    val virtualIndex: Int = 0,
+)
 
 data class StatsLine(
     val fps: Int,
@@ -74,6 +93,12 @@ data class StatsLine(
     val audioMs: Float = 0f,
     val audioTargetMs: Float = 0f,
     val audioUnderruns: Int = 0,
+    /** What the host measured it sends. */
+    val serverKbps: Int = 0,
+    val bitrateNote: String = "",
+    val encodeP99Ms: Float = 0f,
+    val lossPercent: Float = 0f,
+    val framesRecovered: Int = 0,
 )
 
 data class OfferedFile(val name: String, val size: Long, val isDir: Boolean)
@@ -96,9 +121,15 @@ sealed interface CoreEvent {
         val print: Boolean = false,
         val usb: Boolean = false,
         val hdr: Boolean = false,
+        /** The host knows virtual displays (protocol feature; the driver may still be missing). */
+        val virtualDisplay: Boolean = false,
     ) : CoreEvent
     data class Reconnecting(val message: String) : CoreEvent
     data class Disconnected(val message: String) : CoreEvent
+    /** Final: the host's certificate is not the saved one. */
+    data class PinChanged(val message: String) : CoreEvent
+    /** Answer with `confirmFingerprint`. */
+    data class VerifyFingerprint(val fingerprint: String) : CoreEvent
     data class SessionInfo(
         val hostName: String,
         val virtualDisplayAvailable: Boolean,
@@ -116,6 +147,11 @@ sealed interface CoreEvent {
         val codec: String,
         val encoder: String,
         val hdr: Boolean = false,
+        val displayId: Int = 0,
+        /** HDR desktop sent tone-mapped to SDR. */
+        val hdrTonemapped: Boolean = false,
+        /** "[capture]→[encode]" when two GPUs are involved. */
+        val crossGpu: String = "",
     ) : CoreEvent
     data class StreamError(val message: String) : CoreEvent
     data class Role(val controlling: Boolean, val controller: String, val viewers: List<String>) : CoreEvent
@@ -157,9 +193,12 @@ sealed interface CoreEvent {
                     s("serverName"), s("serverVersion"), s("serverFingerprint"), s("serverFingerprintShort"),
                     b("textInput"), b("fileTransfer"), b("gamepad"),
                     b("clipboardImage"), b("clipboardFiles"), b("microphone"), b("folderMount"), b("print"), b("usb"), b("hdr"),
+                    b("virtualDisplay"),
                 )
                 "reconnecting" -> Reconnecting(s("message"))
                 "disconnected" -> Disconnected(s("message"))
+                "pinChanged" -> PinChanged(s("message"))
+                "verifyFingerprint" -> VerifyFingerprint(s("fingerprint"))
                 "sessionInfo" -> SessionInfo(
                     s("hostName"),
                     b("virtualDisplayAvailable"),
@@ -168,12 +207,15 @@ sealed interface CoreEvent {
                         fun ds(k: String) = d[k]?.jsonPrimitive?.content ?: ""
                         fun di(k: String) = d[k]?.jsonPrimitive?.int ?: 0
                         fun db(k: String) = d[k]?.jsonPrimitive?.boolean ?: false
-                        HostDisplay(di("id"), ds("name"), di("width"), di("height"), db("primary"), db("isVirtual"))
+                        HostDisplay(di("id"), ds("name"), di("width"), di("height"), db("primary"), db("isVirtual"), db("hdr"), di("refreshHz"), di("virtualIndex"))
                     } ?: emptyList(),
                     s("micDevice"),
                     b("usbAvailable"),
                 )
-                "streamStarted" -> StreamStarted(i("width"), i("height"), i("sourceWidth"), i("sourceHeight"), i("fps"), s("codec"), s("encoder"), b("hdr"))
+                "streamStarted" -> StreamStarted(
+                    i("width"), i("height"), i("sourceWidth"), i("sourceHeight"), i("fps"), s("codec"), s("encoder"), b("hdr"),
+                    i("displayId"), b("hdrTonemapped"), s("crossGpu"),
+                )
 
                 "streamError" -> StreamError(s("message"))
                 "role" -> Role(b("controlling"), s("controller"), o["viewers"]?.jsonArray?.map { it.jsonPrimitive.content } ?: emptyList())
@@ -185,6 +227,7 @@ sealed interface CoreEvent {
                         i("fps"), f("mbps"), f("rttMs"), f("latencyMs"), f("decodeMs"), i("serverFps"),
                         f("encodeMs"), i("targetKbps"), i("fecPercent"), i("framesLost"), i("framesDropped"),
                         f("audioMs"), f("audioTargetMs"), i("audioUnderruns"),
+                        i("serverKbps"), s("bitrateNote"), f("encodeP99Ms"), f("lossPercent"), i("framesRecovered"),
                     ),
                 )
                 "fileOffer" -> FileOffer(

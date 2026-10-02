@@ -92,6 +92,9 @@ class Gamepads(private val send: (index: Int, connected: Boolean, state: PadStat
     /** Called when the first controller is seen (e.g. to tell the user). */
     var onFirstPad: ((String) -> Unit)? = null
 
+    /** Called when controllers come or go, with how many there are. */
+    var onCount: ((Int) -> Unit)? = null
+
     private fun isPad(source: Int) =
         source and InputDevice.SOURCE_GAMEPAD == InputDevice.SOURCE_GAMEPAD ||
             source and InputDevice.SOURCE_JOYSTICK == InputDevice.SOURCE_JOYSTICK
@@ -101,7 +104,10 @@ class Gamepads(private val send: (index: Int, connected: Boolean, state: PadStat
         pads[d.id]?.let { return it }
         val free = (0..3).firstOrNull { i -> pads.values.none { it.index == i } } ?: return null
         if (pads.isEmpty()) onFirstPad?.invoke(d.name)
-        return Pad(free).also { pads[d.id] = it }
+        return Pad(free).also {
+            pads[d.id] = it
+            onCount?.invoke(pads.size)
+        }
     }
 
     /** A gamepad key; true if consumed. */
@@ -141,12 +147,14 @@ class Gamepads(private val send: (index: Int, connected: Boolean, state: PadStat
     fun removed(deviceId: Int) {
         val p = pads.remove(deviceId) ?: return
         send(p.index, false, PadState())
+        onCount?.invoke(pads.size)
     }
 
     /** Unplug every pad on the host (session ends). */
     fun clear() {
         pads.values.forEach { send(it.index, false, PadState()) }
         pads.clear()
+        onCount?.invoke(0)
     }
 
     /** Host force feedback for pad [index]. */

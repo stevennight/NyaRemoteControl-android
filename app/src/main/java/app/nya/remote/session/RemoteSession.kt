@@ -49,6 +49,8 @@ class RemoteSession(dataDir: String, config: StartConfig, private val onEvent: (
     fun nextAudio(buf: ByteBuffer, timeoutMs: Int): Int = onHandle { NativeCore.nextAudio(it, buf, timeoutMs) } ?: -1
 
     fun providePairCode(code: String?) = onHandle { NativeCore.providePairCode(it, code) }
+    fun confirmFingerprint(ok: Boolean) = onHandle { NativeCore.confirmFingerprint(it, ok) }
+    fun mouseBy(dx: Int, dy: Int) = onHandle { NativeCore.mouseRel(it, dx, dy) }
 
     /** rx, ry: 0..1 across the remote display. */
     fun mouseTo(rx: Float, ry: Float) = onHandle {

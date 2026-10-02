@@ -2,113 +2,171 @@ package app.nya.remote.data
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.os.Build
 import androidx.core.content.edit
 import app.nya.remote.core.ShareConfig
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
-
 
 enum class ControlMode { TOUCH, MOUSE }
 
-/** How large the host's screen is made. */
-enum class Resolution {
-    /** A virtual screen with the phone's own resolution. */
-    SCREEN,
-    /** A virtual screen with the phone's aspect ratio, at most 1080 lines (lighter on network and decoder). */
-    SCREEN_1080,
-    /** No virtual screen: the host's displays as they are. */
-    HOST,
-}
-
-data class Settings(
-    val resolution: Resolution = Resolution.SCREEN,
-    /** Windows display scaling of the virtual screen, in percent. */
-    val scalePercent: Int = 150,
-    val maxFps: Int = 60,
-    val gameMode: Boolean = false,
-    /** "auto" / "h264" / "hevc" / "av1". */
-    val codec: String = "auto",
+/**
+ * Connection settings: the defaults, or one host's own settings. The same
+ * choices as the Windows client's `Defaults` (windows/app/src/config.rs),
+ * minus what a phone has no use for (windows, full screen, keyboard capture,
+ * 4:4:4), plus the phone's own (touch / mouse operation, keyboard kind).
+ */
+@Serializable
+data class ConnSettings(
+    /** "office" | "game". */
+    val mode: String = "office",
+    /** Host display to show; 0 = primary (the first virtual screen while there is one). */
+    val display: Int = 0,
     /** 0 = the host decides. */
     val bitrateKbps: Int = 0,
-    val audio: Boolean = true,
-    val physicalOff: Boolean = false,
-    val controlMode: ControlMode = ControlMode.TOUCH,
-    val showGuideOnConnect: Boolean = true,
-    val showStats: Boolean = false,
-    /** Host clipboard text goes to the phone's clipboard. */
-    val syncClipboard: Boolean = true,
-    /** "auto" / "stream" / "datagram". */
-    val videoTransport: String = "auto",
-    /** "auto" / "quality" / "balanced" / "smooth" / "fixed". */
+    /** The top of the encoder's range (ignores [bitrateKbps]). */
+    val unlimitedBitrate: Boolean = false,
+    /** "auto" | "quality" | "balanced" | "smooth" | "fixed". */
     val bitratePolicy: String = "auto",
+    /** "auto" | "stream" | "datagram". */
+    val videoTransport: String = "auto",
+    /** 0 = the screen's refresh rate. */
+    val maxFps: Int = 60,
+    /** Host encoder: "auto" | "nvenc" | "qsv" | "amf" | "software". */
+    val encoder: String = "auto",
+    /** "auto" | "h264" | "hevc" | "av1". */
+    val codec: String = "auto",
+    val audio: Boolean = true,
+    /** Host clipboard (text, images, files) to the phone. */
+    val clipboard: Boolean = true,
+    /** Hardware decoders where the phone has them (otherwise software). */
+    val hwDecode: Boolean = true,
+    /** Virtual screens to create on the host (0 = none, up to 4). */
+    val vdCount: Int = 1,
+    /** Switch the host's physical displays off (with at least one virtual screen). */
+    val physicalOff: Boolean = false,
+    /** Block the host's own keyboard and mouse. */
+    val blockInput: Boolean = false,
+    /** Virtual screen size: "screen" (the phone's) | "screen1080" (same shape, at most 1080 lines) | "fixed". */
+    val vdSize: String = "screen",
+    val vdWidth: Int = 1920,
+    val vdHeight: Int = 1080,
+    /** Windows display scaling of the virtual screens in percent; 0 = leave as is. */
+    val vdScale: Int = 150,
+    /** Microphone on after connecting. */
+    val mic: Boolean = false,
+    /** Print jobs from the host: "ask" | "print" | "open" | "save". */
+    val printMode: String = "ask",
     /** HDR10 when the phone's screen, its decoder and the host can. */
     val hdr: Boolean = true,
-    /** The PC-layout on-screen keyboard instead of the phone's input method (remembered). */
+    val controlMode: ControlMode = ControlMode.TOUCH,
+    /** The PC-layout on-screen keyboard instead of the phone's input method. */
     val pcKeyboard: Boolean = false,
-    /** Microphone on at connect (remembered from the panel). */
-    val mic: Boolean = false,
     /** Phone folders shown on the host as a drive. */
-    val shares: List<ShareConfig> = emptyList(),
-)
+    val sharedFolders: List<ShareConfig> = emptyList(),
+) {
+    val game: Boolean get() = mode == "game"
 
-class SettingsStore(private val prefs: SharedPreferences) {
+    /** (virtual screens, physical displays off, local input blocked). */
+    val displayChoice: DisplayChoice get() = DisplayChoice(vdCount, physicalOff && vdCount > 0, blockInput)
+
+    fun withDisplayChoice(c: DisplayChoice) = copy(
+        vdCount = c.count.coerceIn(0, 4),
+        physicalOff = c.physicalOff && c.count > 0,
+        blockInput = c.blockInput,
+        // The first virtual screen is the host's primary display while it exists.
+        display = if (c.count != vdCount) 0 else display,
+    )
+}
+
+data class DisplayChoice(val count: Int = 0, val physicalOff: Boolean = false, val blockInput: Boolean = false) {
+    companion object {
+        val ASIS = DisplayChoice()
+        fun privacy(count: Int) = DisplayChoice(count.coerceAtLeast(1), physicalOff = true, blockInput = true)
+    }
+}
+
+/** App-wide settings (not per host). */
+@Serializable
+data class AppConfig(
+    /** This phone's name as hosts show it; empty = the model name. */
+    val clientName: String = "",
+    /** Look for a new version when the app starts (installing is the user's choice). */
+    val checkUpdates: Boolean = true,
+    val showGuideOnConnect: Boolean = true,
+    val showStats: Boolean = false,
+    val defaults: ConnSettings = ConnSettings(),
+) {
+    /** The name hosts see. */
+    val effectiveClientName: String get() = clientName.trim().ifBlank { deviceName() }
+
+    companion object {
+        fun deviceName(): String {
+            val maker = Build.MANUFACTURER.orEmpty()
+            val model = Build.MODEL.orEmpty()
+            return (if (model.startsWith(maker, ignoreCase = true)) model else "$maker $model").trim().ifBlank { "Android" }
+        }
+    }
+}
+
+class ConfigStore(private val prefs: SharedPreferences) {
     constructor(context: Context) : this(context.getSharedPreferences("settings", Context.MODE_PRIVATE))
 
-    fun load(): Settings {
-        val d = Settings()
-        return Settings(
-            resolution = enumOr(prefs.getString("resolution", null), d.resolution),
-            scalePercent = prefs.getInt("scalePercent", d.scalePercent),
-            maxFps = prefs.getInt("maxFps", d.maxFps),
-            gameMode = prefs.getBoolean("gameMode", d.gameMode),
-            codec = prefs.getString("codec", d.codec) ?: d.codec,
-            bitrateKbps = prefs.getInt("bitrateKbps", d.bitrateKbps),
-            audio = prefs.getBoolean("audio", d.audio),
-            physicalOff = prefs.getBoolean("physicalOff", d.physicalOff),
-            controlMode = enumOr(prefs.getString("controlMode", null), d.controlMode),
-            showGuideOnConnect = prefs.getBoolean("showGuideOnConnect", d.showGuideOnConnect),
-            showStats = prefs.getBoolean("showStats", d.showStats),
-            syncClipboard = prefs.getBoolean("syncClipboard", d.syncClipboard),
-            videoTransport = prefs.getString("videoTransport", d.videoTransport) ?: d.videoTransport,
-            bitratePolicy = prefs.getString("bitratePolicy", d.bitratePolicy) ?: d.bitratePolicy,
-            hdr = prefs.getBoolean("hdr", d.hdr),
-            mic = prefs.getBoolean("mic", d.mic),
-            pcKeyboard = prefs.getBoolean("pcKeyboard", d.pcKeyboard),
-            shares = prefs.getString("shares", null)?.let {
+    private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
+
+    fun load(): AppConfig {
+        prefs.getString(KEY, null)?.let { text ->
+            try {
+                return json.decodeFromString<AppConfig>(text)
+            } catch (_: Exception) {
+            }
+        }
+        return migrate(prefs)
+    }
+
+    fun save(c: AppConfig) = prefs.edit { putString(KEY, json.encodeToString(c)) }
+
+    fun update(f: (AppConfig) -> AppConfig): AppConfig = f(load()).also { save(it) }
+
+    companion object {
+        private const val KEY = "config"
+
+        /** Settings of 0.1.x (one flat set of preferences, no per-host settings). */
+        fun migrate(p: SharedPreferences): AppConfig {
+            val d = ConnSettings()
+            if (!p.contains("resolution") && !p.contains("gameMode")) return AppConfig()
+            val resolution = p.getString("resolution", "SCREEN")
+            val shares = p.getString("shares", null)?.let {
                 try {
                     Json.decodeFromString<List<ShareConfig>>(it)
                 } catch (_: Exception) {
                     null
                 }
-            } ?: d.shares,
-        )
-    }
-
-    fun save(s: Settings) {
-        prefs.edit {
-            putString("resolution", s.resolution.name)
-            putInt("scalePercent", s.scalePercent)
-            putInt("maxFps", s.maxFps)
-            putBoolean("gameMode", s.gameMode)
-            putString("codec", s.codec)
-            putInt("bitrateKbps", s.bitrateKbps)
-            putBoolean("audio", s.audio)
-            putBoolean("physicalOff", s.physicalOff)
-            putString("controlMode", s.controlMode.name)
-            putBoolean("showGuideOnConnect", s.showGuideOnConnect)
-            putBoolean("showStats", s.showStats)
-            putBoolean("syncClipboard", s.syncClipboard)
-            putString("videoTransport", s.videoTransport)
-            putString("bitratePolicy", s.bitratePolicy)
-            putBoolean("hdr", s.hdr)
-            putBoolean("mic", s.mic)
-            putBoolean("pcKeyboard", s.pcKeyboard)
-
-            putString("shares", Json.encodeToString(s.shares))
+            } ?: emptyList()
+            val s = d.copy(
+                mode = if (p.getBoolean("gameMode", false)) "game" else "office",
+                vdCount = if (resolution == "HOST") 0 else 1,
+                vdSize = if (resolution == "SCREEN_1080") "screen1080" else "screen",
+                vdScale = p.getInt("scalePercent", d.vdScale),
+                maxFps = p.getInt("maxFps", d.maxFps),
+                codec = p.getString("codec", d.codec) ?: d.codec,
+                bitrateKbps = p.getInt("bitrateKbps", d.bitrateKbps),
+                audio = p.getBoolean("audio", d.audio),
+                physicalOff = p.getBoolean("physicalOff", d.physicalOff) && resolution != "HOST",
+                controlMode = if (p.getString("controlMode", null) == "MOUSE") ControlMode.MOUSE else ControlMode.TOUCH,
+                clipboard = p.getBoolean("syncClipboard", d.clipboard),
+                videoTransport = p.getString("videoTransport", d.videoTransport) ?: d.videoTransport,
+                bitratePolicy = p.getString("bitratePolicy", d.bitratePolicy) ?: d.bitratePolicy,
+                hdr = p.getBoolean("hdr", d.hdr),
+                mic = p.getBoolean("mic", d.mic),
+                pcKeyboard = p.getBoolean("pcKeyboard", d.pcKeyboard),
+                sharedFolders = shares,
+            )
+            return AppConfig(
+                showGuideOnConnect = p.getBoolean("showGuideOnConnect", true),
+                showStats = p.getBoolean("showStats", false),
+                defaults = s,
+            )
         }
     }
-
-    fun update(f: (Settings) -> Settings) = save(f(load()))
-
-    private inline fun <reified E : Enum<E>> enumOr(name: String?, default: E): E =
-        enumValues<E>().find { it.name == name } ?: default
 }

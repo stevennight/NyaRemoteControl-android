@@ -166,6 +166,14 @@ pub extern "system" fn Java_app_nya_remote_core_NativeCore_providePairCode<'l>(
     }
 }
 
+/// Answer to a `verifyFingerprint` event.
+#[no_mangle]
+pub extern "system" fn Java_app_nya_remote_core_NativeCore_confirmFingerprint(_env: JNIEnv, _cls: JClass, h: jlong, ok: jboolean) {
+    if let Some(s) = session(h) {
+        s.confirm_fingerprint(ok == JNI_TRUE);
+    }
+}
+
 /// x, y: 0..65535 across the streamed display.
 #[no_mangle]
 pub extern "system" fn Java_app_nya_remote_core_NativeCore_mouseAbs(_env: JNIEnv, _cls: JClass, h: jlong, x: jint, y: jint) {

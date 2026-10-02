@@ -30,6 +30,9 @@ object NativeCore {
     /** Answer to a `needPairing` event; null cancels. */
     @JvmStatic external fun providePairCode(handle: Long, code: String?)
 
+    /** Answer to a `verifyFingerprint` event. */
+    @JvmStatic external fun confirmFingerprint(handle: Long, ok: Boolean)
+
     @JvmStatic external fun mouseAbs(handle: Long, x: Int, y: Int)
     @JvmStatic external fun mouseRel(handle: Long, dx: Int, dy: Int)
     @JvmStatic external fun mouseButton(handle: Long, button: Int, down: Boolean)

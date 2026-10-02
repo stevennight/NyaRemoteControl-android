@@ -16,7 +16,7 @@ import android.provider.Settings
  */
 object Shares {
     fun accessGranted(context: Context? = null): Boolean = when {
-        Build.VERSION.SDK_INT >= 30 -> Environment.isExternalStorageManager()
+        Build.VERSION.SDK_INT >= 30 -> runCatching { Environment.isExternalStorageManager() }.getOrDefault(false)
         context == null -> true
         else -> context.checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
     }

@@ -39,18 +39,24 @@ object DecoderCaps {
     }
 
     /**
-     * The best decoder per codec: hardware where there is one. Software
-     * decoders are offered only for H.264 and only when nothing else exists
-     * (emulators); software HEVC / AV1 is too slow on a phone.
+     * The decoder per codec: hardware where there is one (unless [hardware] is
+     * off). Software decoders are offered only for H.264 when hardware is
+     * wanted and nothing else exists (emulators): software HEVC / AV1 is too
+     * slow on most phones. With [hardware] off, software decoders are used
+     * for every codec that has one (for phones whose hardware decoder misbehaves).
      */
-    fun detect(): List<Decoder> {
+    fun detect(hardware: Boolean = true): List<Decoder> {
         val infos = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.filter { !it.isEncoder }
         val out = mutableListOf<Decoder>()
         for ((codec, mime) in mimes) {
             val candidates = infos.filter { info -> info.supportedTypes.any { it.equals(mime, ignoreCase = true) } }
-            val best = candidates.firstOrNull { isHardware(it) } ?: candidates.firstOrNull() ?: continue
+            val best = if (hardware) {
+                candidates.firstOrNull { isHardware(it) } ?: candidates.firstOrNull()
+            } else {
+                candidates.firstOrNull { !isHardware(it) }
+            } ?: continue
             val hw = isHardware(best)
-            if (!hw && codec != "h264") continue
+            if (hardware && !hw && codec != "h264") continue
             val caps = try {
                 best.getCapabilitiesForType(mime)
             } catch (_: Exception) {
@@ -68,5 +74,23 @@ object DecoderCaps {
             out += Decoder("h264", "video/avc", "", false, 0, 0)
         }
         return out
+    }
+
+    /** One line for the about page, e.g. "硬件解码：HEVC（10 bit）· H.264 · AV1". */
+    fun summary(decoders: List<Decoder>): String {
+        val hw = decoders.filter { it.hardware && it.name.isNotEmpty() }
+        if (hw.isEmpty()) return "没有可用的硬件解码器，使用软件解码（画面可能卡顿）"
+        val order = listOf("hevc", "h264", "av1")
+        val names = hw.sortedBy { order.indexOf(it.codec) }.joinToString(" · ") { d ->
+            label(d.codec) + (if (d.tenBit) "（10 bit）" else "") + (if (d.maxWidth > 0) " 最大 ${d.maxWidth}×${d.maxHeight}" else "")
+        }
+        return "硬件解码：$names"
+    }
+
+    fun label(codec: String) = when (codec) {
+        "h264" -> "H.264"
+        "hevc" -> "HEVC"
+        "av1" -> "AV1"
+        else -> codec
     }
 }

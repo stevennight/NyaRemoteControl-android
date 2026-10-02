@@ -1,5 +1,7 @@
 package app.nya.remote
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.os.Bundle
 import android.widget.Toast
@@ -8,122 +10,166 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.layout.Box
-import androidx.compose.material3.AlertDialog
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.WindowInsetsSides
+import androidx.compose.foundation.layout.only
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Home
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.NavigationRail
+import androidx.compose.material3.NavigationRailItem
+import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
-import androidx.core.content.edit
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.unit.dp
 import app.nya.remote.data.Host
-import app.nya.remote.data.HostStore
-import app.nya.remote.data.SettingsStore
-import app.nya.remote.data.Updater
 import app.nya.remote.session.SessionActivity
-import app.nya.remote.ui.HostsScreen
+import app.nya.remote.ui.AboutScreen
+import app.nya.remote.ui.ConnSettingsScreen
+import app.nya.remote.ui.DeviceActions
+import app.nya.remote.ui.DevicesScreen
+import app.nya.remote.ui.LauncherModel
 import app.nya.remote.ui.NyaTheme
-import app.nya.remote.ui.SettingsScreen
-import kotlin.concurrent.thread
 
-class MainActivity : ComponentActivity() {
-    private lateinit var hosts: HostStore
-    private val hostList = mutableStateOf(emptyList<Host>())
+/** The launcher: devices, connection settings, about (the Windows client's main page, for a phone). */
+class MainActivity : ComponentActivity(), DeviceActions {
+    private lateinit var model: LauncherModel
 
-    /** A newer release found on GitHub. */
-    private val update = mutableStateOf<Updater.Release?>(null)
+    private enum class Page(val label: String, val icon: ImageVector) {
+        DEVICES("设备", Icons.Filled.Home),
+        SETTINGS("连接设置", Icons.Filled.Settings),
+        ABOUT("关于与诊断", Icons.Filled.Info),
+    }
 
-    /** Download progress text while updating; null otherwise. */
-    private val updating = mutableStateOf<String?>(null)
+    /** Page and settings scope, set from a device's menu. */
+    private val page = mutableStateOf(Page.DEVICES)
+    private val scope = mutableStateOf<String?>(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        hosts = HostStore(this)
-        val settings = SettingsStore(this)
+        model = LauncherModel(this)
+        savedInstanceState?.getString("page")?.let { p -> Page.entries.find { it.name == p }?.let { page.value = it } }
+        scope.value = savedInstanceState?.getString("scope")
         setContent {
             NyaTheme {
-                var showSettings by remember { mutableStateOf(false) }
-                BackHandler(showSettings) { showSettings = false }
-                Box {
-                    if (showSettings) {
-                        SettingsScreen(settings, onCheckUpdate = { checkUpdate(manual = true) }) { showSettings = false }
+                BackHandler(page.value != Page.DEVICES) { page.value = Page.DEVICES }
+                BoxWithConstraints(Modifier.fillMaxSize()) {
+                    val wide = maxWidth >= 720.dp
+                    if (wide) {
+                        Row(Modifier.fillMaxSize()) {
+                            NavigationRail(Modifier.windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Start + WindowInsetsSides.Vertical))) {
+                                Page.entries.forEach { p ->
+                                    NavigationRailItem(
+                                        selected = page.value == p,
+                                        onClick = { open(p) },
+                                        icon = { Icon(p.icon, null) },
+                                        label = { Text(p.label) },
+                                    )
+                                }
+                            }
+                            Box(
+                                Modifier
+                                    .fillMaxSize()
+                                    .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.End + WindowInsetsSides.Vertical)),
+                                contentAlignment = Alignment.TopCenter,
+                            ) {
+                                Box(Modifier.widthIn(max = 1100.dp)) { Content(PaddingValues()) }
+                            }
+                        }
                     } else {
-                        HostsScreen(
-                            hosts = hostList.value,
-                            onSave = { hosts.put(it); refresh() },
-                            onDelete = { hosts.remove(it.id); refresh() },
-                            onConnect = { host, code -> startActivity(SessionActivity.intent(this@MainActivity, host.id, code)) },
-                            onSettings = { showSettings = true },
-                        )
-                    }
-                    update.value?.let { r ->
-                        AlertDialog(
-                            onDismissRequest = { update.value = null },
-                            title = { Text("发现新版本 ${r.version}") },
-                            text = { Text(updating.value ?: r.notes.take(600).ifBlank { "当前版本 ${BuildConfig.VERSION_NAME}" }) },
-                            confirmButton = {
-                                TextButton(enabled = updating.value == null, onClick = { install(r) }) { Text("下载并安装") }
+                        Scaffold(
+                            containerColor = MaterialTheme.colorScheme.background,
+                            bottomBar = {
+                                NavigationBar {
+                                    Page.entries.forEach { p ->
+                                        NavigationBarItem(
+                                            selected = page.value == p,
+                                            onClick = { open(p) },
+                                            icon = { Icon(p.icon, null) },
+                                            label = { Text(p.label) },
+                                        )
+                                    }
+                                }
                             },
-                            dismissButton = { TextButton(onClick = { update.value = null }) { Text("以后再说") } },
-                        )
+                        ) { pad ->
+                            Column(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal))) {
+                                Content(pad)
+                            }
+                        }
                     }
                 }
             }
         }
-        // At most once a day on its own.
-        val prefs = getSharedPreferences("update", Context.MODE_PRIVATE)
-        if (System.currentTimeMillis() - prefs.getLong("checked", 0) > 24 * 3600_000L) {
-            prefs.edit { putLong("checked", System.currentTimeMillis()) }
-            checkUpdate(manual = false)
+        if (model.config.checkUpdates) model.checkUpdate()
+    }
+
+    @androidx.compose.runtime.Composable
+    private fun Content(pad: PaddingValues) {
+        Box(Modifier.fillMaxSize().padding(top = 0.dp)) {
+            when (page.value) {
+                Page.DEVICES -> DevicesScreen(model, this@MainActivity, pad)
+                Page.SETTINGS -> ConnSettingsScreen(model, scope.value, { scope.value = it }, pad)
+                Page.ABOUT -> AboutScreen(model, ::installUpdate, pad)
+            }
         }
+    }
+
+    private fun open(p: Page) {
+        if (p == Page.SETTINGS && page.value != Page.SETTINGS) scope.value = null
+        page.value = p
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putString("page", page.value.name)
+        outState.putString("scope", scope.value)
     }
 
     override fun onResume() {
         super.onResume()
-        refresh()
+        model.reload()
     }
 
-    private fun refresh() {
-        hostList.value = hosts.all().sortedByDescending { it.lastConnected }
+    // ------------------------------------------------------------ DeviceActions
+
+    override fun connect(address: String, name: String?) {
+        if (address.isBlank()) return
+        // A saved host may also be picked by its name.
+        val host = model.book.hosts.find { it.address == address || it.name == address }
+        startActivity(SessionActivity.intent(this, host?.address ?: address, if (host == null) name else null))
     }
 
-    private fun checkUpdate(manual: Boolean) {
-        thread(name = "nya-update") {
-            val r = try {
-                Updater.latest()
-            } catch (_: Exception) {
-                null
-            }
-            runOnUiThread {
-                when {
-                    r != null && Updater.newer(r.version, BuildConfig.VERSION_NAME) -> update.value = r
-                    manual && r == null -> Toast.makeText(this, "无法检查更新（网络或 GitHub 不可用）", Toast.LENGTH_SHORT).show()
-                    manual -> Toast.makeText(this, "已是最新版本", Toast.LENGTH_SHORT).show()
-                }
-            }
-        }
+    override fun hostSettings(h: Host) {
+        scope.value = h.id
+        page.value = Page.SETTINGS
     }
 
-    private fun install(r: Updater.Release) {
-        updating.value = "正在下载…"
-        thread(name = "nya-update") {
-            try {
-                val apk = Updater.download(this, r) { done, total ->
-                    val text = if (total > 0) "正在下载 ${done * 100 / total}%" else "正在下载 ${done / 1_000_000} MB"
-                    runOnUiThread { updating.value = text }
-                }
-                runOnUiThread {
-                    updating.value = null
-                    update.value = null
-                    Updater.install(this, apk)
-                }
-            } catch (e: Exception) {
-                runOnUiThread {
-                    updating.value = null
-                    Toast.makeText(this, "更新失败：${e.message}", Toast.LENGTH_LONG).show()
-                }
-            }
-        }
+    override fun copyAddress(h: Host) {
+        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        cm.setPrimaryClip(ClipData.newPlainText("地址", h.address))
+        Toast.makeText(this, "已复制地址", Toast.LENGTH_SHORT).show()
     }
+
+    override fun installUpdate() = model.installUpdate(this)
 }

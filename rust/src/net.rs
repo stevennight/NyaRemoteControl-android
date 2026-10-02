@@ -137,7 +137,8 @@ struct Params {
     start: pb::StartStream,
     download_dir: Option<std::path::PathBuf>,
 }
-
+
+
 
 enum End {
     UserQuit,
@@ -167,8 +168,27 @@ pub async fn main(cfg: StartConfig, identity: Identity, sh: Arc<Shared>, mut cmd
     };
     let link = match first {
         Ok(l) => l,
-        Err(e) => return sh.event(Event::Disconnected { message: format!("{e:#}") }),
+        Err(e) => {
+            let message = format!("{e:#}");
+            // The pin did not match: the app offers to check the host again.
+            if pinned.is_some() && message.contains(nya_transport::tls::PIN_MISMATCH) {
+                return sh.event(Event::PinChanged { message });
+            }
+            return sh.event(Event::Disconnected { message });
+        }
     };
+    // Connected without the saved pin and no pairing code proved who the host
+    // is: the user compares the fingerprint with the host's own display.
+    if cfg.reverify && !link.welcome.needs_pairing {
+        let (sh2, fp) = (sh.clone(), link.server_fp.to_string());
+        let ok = tokio::select! {
+            r = tokio::task::spawn_blocking(move || sh2.ask_fingerprint_ok(fp)) => r.unwrap_or(false),
+            _ = wait_quit(&mut cmds) => false,
+        };
+        if !ok {
+            return sh.event(Event::Disconnected { message: "证书指纹未确认，已取消连接".into() });
+        }
+    }
     let p = Params {
         addr,
         pinned: link.server_fp,
@@ -240,6 +260,7 @@ async fn supervise(first: Link, mut p: Params, mut cmds: mpsc::UnboundedReceiver
             print: l.neg.has(Feature::Print),
             usb: l.neg.has(Feature::UsbRedirect),
             hdr: l.neg.has(Feature::Hdr),
+            virtual_display: l.neg.has(Feature::VirtualDisplay),
         });
         match run(l, &mut p, &mut cmds, sh).await {
             End::UserQuit => return sh.event(Event::Disconnected { message: "已断开".into() }),

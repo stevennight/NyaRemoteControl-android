@@ -28,6 +28,7 @@ pub enum Event {
         print: bool,
         usb: bool,
         hdr: bool,
+        virtual_display: bool,
     },
     Reconnecting {
         message: String,
@@ -35,6 +36,16 @@ pub enum Event {
     /// Final: the session is over.
     Disconnected {
         message: String,
+    },
+    /// Final: the host's certificate is not the saved one (reinstalled, or
+    /// someone pretends to be it). The app may connect again with `reverify`.
+    PinChanged {
+        message: String,
+    },
+    /// Connected without the saved pin and the host already knows this phone:
+    /// show the fingerprint, answer with `confirmFingerprint`.
+    VerifyFingerprint {
+        fingerprint: String,
     },
     SessionInfo {
         host_name: String,
@@ -55,6 +66,10 @@ pub enum Event {
         display_id: u32,
         /// HDR10 (HEVC Main10, BT.2020, PQ).
         hdr: bool,
+        /// The host desktop is HDR and is sent tone-mapped to SDR.
+        hdr_tonemapped: bool,
+        /// Captured on one GPU, encoded on another: "[capture]→[encode]".
+        cross_gpu: String,
     },
     StreamError {
         message: String,
@@ -150,6 +165,11 @@ pub struct Display {
     pub height: u32,
     pub primary: bool,
     pub is_virtual: bool,
+    /// HDR desktop (sent tone-mapped unless HDR10 passthrough is on).
+    pub hdr: bool,
+    pub refresh_hz: u32,
+    /// 1-based index among the session's virtual screens (0 = physical).
+    pub virtual_index: u32,
 }
 
 /// Once a second, for the statistics overlay.
@@ -165,7 +185,16 @@ pub struct StatsLine {
     pub server_fps: u32,
     pub encode_ms: f32,
     pub target_kbps: u32,
+    /// What the host measured it sends.
+    pub server_kbps: u32,
+    /// Bitrate policy and the reason of its last change.
+    pub bitrate_note: String,
+    /// 99th percentile over 10 s (0 = the host doesn't report it).
+    pub encode_p99_ms: f32,
     pub fec_percent: u32,
+    /// Video datagrams: shards lost (percent) and frames rebuilt from parity.
+    pub loss_percent: f32,
+    pub frames_recovered: u32,
     pub frames_lost: u32,
     pub frames_dropped: u32,
     /// Audio jitter buffer: current depth and target (ms), underruns so far.
@@ -200,6 +229,9 @@ impl Event {
                     height: d.height,
                     primary: d.primary,
                     is_virtual: d.is_virtual,
+                    hdr: d.hdr,
+                    refresh_hz: d.refresh_hz,
+                    virtual_index: d.virtual_index,
                 })
                 .collect(),
         }
@@ -217,7 +249,8 @@ impl Event {
             encoder: s.encoder_name.clone(),
             display_id: s.display_id,
             hdr: c.hdr,
-
+            hdr_tonemapped: s.hdr_tonemapped,
+            cross_gpu: if s.cross_gpu { format!("[{}]→[{}]", s.capture_gpu_index, s.encode_gpu_index) } else { String::new() },
         }
     }
 
@@ -256,5 +289,8 @@ mod tests {
         let e = Event::Stats(StatsLine { fps: 60, ..Default::default() });
         assert!(e.to_json().starts_with(r#"{"type":"stats","fps":60,"#));
         assert_eq!(Event::NeedPairing.to_json(), r#"{"type":"needPairing"}"#);
+        let e = Event::VerifyFingerprint { fingerprint: "AB:CD".into() };
+        assert_eq!(e.to_json(), r#"{"type":"verifyFingerprint","fingerprint":"AB:CD"}"#);
+        assert_eq!(Event::PinChanged { message: "m".into() }.to_json(), r#"{"type":"pinChanged","message":"m"}"#);
     }
 }

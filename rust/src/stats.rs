@@ -93,7 +93,15 @@ impl Stats {
             server_fps: server.fps,
             encode_ms: server.encode_ms_p50,
             target_kbps: server.target_kbps,
+            server_kbps: server.bitrate_kbps,
+            bitrate_note: server.bitrate_note.clone(),
+            encode_p99_ms: server.encode_ms_p99,
             fec_percent: server.fec_percent,
+            loss_percent: {
+                let total = s.dgram.shards_received + s.dgram.shards_lost;
+                if total == 0 { 0.0 } else { s.dgram.shards_lost as f32 * 100.0 / total as f32 }
+            },
+            frames_recovered: s.dgram.frames_recovered,
             frames_lost: s.dgram.frames_lost,
             frames_dropped: s.dropped,
             audio_ms: audio.level_ms,

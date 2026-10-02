@@ -1,43 +1,33 @@
 package app.nya.remote.session
 
 import android.annotation.SuppressLint
-import android.content.ClipData
-import android.content.ClipboardManager
+import android.app.DownloadManager
 import android.content.Context
 import android.content.Intent
 import android.graphics.Point
+import android.hardware.input.InputManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.view.Display
 import android.view.HapticFeedbackConstants
 import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
-import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.view.inputmethod.InputMethodManager
-import android.hardware.input.InputManager
-import androidx.activity.result.contract.ActivityResultContracts
-import app.nya.remote.data.Downloads
-import app.nya.remote.data.Shares
-import app.nya.remote.input.KeyMap
-import android.view.Display
-
-import app.nya.remote.input.Gamepads
-import kotlinx.serialization.json.add
-import kotlinx.serialization.json.buildJsonArray
-import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.put
 import android.widget.FrameLayout
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.ui.platform.ComposeView
+import androidx.core.content.FileProvider
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
@@ -46,12 +36,18 @@ import app.nya.remote.BuildConfig
 import app.nya.remote.core.CoreEvent
 import app.nya.remote.core.NativeCore
 import app.nya.remote.core.StartConfig
+import app.nya.remote.data.AppConfig
+import app.nya.remote.data.ConfigStore
+import app.nya.remote.data.ConnSettings
 import app.nya.remote.data.ControlMode
-import app.nya.remote.data.Host
+import app.nya.remote.data.DisplayChoice
+import app.nya.remote.data.Downloads
 import app.nya.remote.data.HostStore
-import app.nya.remote.data.SettingsStore
+import app.nya.remote.data.Shares
 import app.nya.remote.input.GestureConfig
 import app.nya.remote.input.GestureEngine
+import app.nya.remote.input.Gamepads
+import app.nya.remote.input.KeyMap
 import app.nya.remote.input.KeyboardController
 import app.nya.remote.input.Pt
 import app.nya.remote.input.RemoteInput
@@ -60,15 +56,25 @@ import app.nya.remote.input.ScanKey
 import app.nya.remote.input.TouchAction
 import app.nya.remote.input.Viewport
 import app.nya.remote.ui.NyaTheme
+import kotlinx.serialization.json.add
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
+import java.io.File
 import kotlin.concurrent.thread
 import kotlin.math.roundToInt
 
 /** The remote screen: video, cursor, touch input and the overlay UI. */
 class SessionActivity : ComponentActivity(), SessionActions {
     private lateinit var hosts: HostStore
-    private lateinit var settingsStore: SettingsStore
-    private lateinit var host: Host
-    private var pairCode: String? = null
+    private lateinit var configStore: ConfigStore
+    private lateinit var config: AppConfig
+    /** The host's address (saved hosts are matched by it). */
+    private lateinit var address: String
+    /** Name for a host that is not saved yet (from the add dialog). */
+    private var newName: String? = null
+    /** Connect once without the saved pin (the user asked to check the host again). */
+    private var reverify = false
 
     private lateinit var ui: SessionUi
     private val viewport = Viewport()
@@ -89,7 +95,6 @@ class SessionActivity : ComponentActivity(), SessionActions {
     private lateinit var clipboard: ClipboardBridge
     private lateinit var usbSharing: UsbSharing
     private var mic: MicCapture? = null
-    private var micFeature = false
     private var streamHdr = false
     /** Keys and pastes leave in order (a paste waits for the host clipboard). */
     private val keyOut = java.util.concurrent.Executors.newSingleThreadExecutor()
@@ -97,27 +102,40 @@ class SessionActivity : ComponentActivity(), SessionActions {
         if (granted) startMic() else Toast.makeText(this, "没有麦克风权限", Toast.LENGTH_SHORT).show()
     }
     private val inputManager by lazy { getSystemService(Context.INPUT_SERVICE) as InputManager }
-    private val padListener = object : InputManager.InputDeviceListener {
-        override fun onInputDeviceAdded(deviceId: Int) {}
-        override fun onInputDeviceChanged(deviceId: Int) {}
-        override fun onInputDeviceRemoved(deviceId: Int) = gamepads.removed(deviceId)
+    private val deviceListener = object : InputManager.InputDeviceListener {
+        override fun onInputDeviceAdded(deviceId: Int) = checkMouse()
+        override fun onInputDeviceChanged(deviceId: Int) = checkMouse()
+        override fun onInputDeviceRemoved(deviceId: Int) {
+            gamepads.removed(deviceId)
+            checkMouse()
+        }
     }
     private val filePicker = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris -> sendPicked(uris) }
     private val main = Handler(Looper.getMainLooper())
     private val longPress = Runnable { gestures.timeout(SystemClock.uptimeMillis()); scheduleLongPress() }
 
+    /** The settings of this session: what the panel shows and changes. */
+    private var sd: ConnSettings
+        get() = ui.settings
+        set(v) {
+            ui.settings = v
+        }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         hosts = HostStore(this)
-        settingsStore = SettingsStore(this)
-        host = intent.getStringExtra(EXTRA_HOST_ID)?.let { hosts.get(it) } ?: run {
+        configStore = ConfigStore(this)
+        config = configStore.load()
+        address = intent.getStringExtra(EXTRA_ADDRESS)?.trim().orEmpty()
+        if (address.isEmpty()) {
             finish()
             return
         }
-        pairCode = intent.getStringExtra(EXTRA_PAIR_CODE)
-        val settings = settingsStore.load()
-        ui = SessionUi(settings.controlMode, settings.showStats, settings.gameMode, settings.showGuideOnConnect)
-        ui.hostName = host.displayName
+        newName = intent.getStringExtra(EXTRA_NAME)?.trim()?.ifBlank { null }
+        val book = hosts.book()
+        val settings = book.settingsFor(address, config.defaults)
+        ui = SessionUi(settings, config.showStats, config.showGuideOnConnect)
+        ui.hostName = book.byAddress(address)?.displayName ?: newName ?: address
 
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         if (Build.VERSION.SDK_INT >= 28) {
@@ -154,8 +172,10 @@ class SessionActivity : ComponentActivity(), SessionActions {
         gamepads = Gamepads { i, connected, st ->
             session?.gamepad(i, connected, st.buttons, st.leftTrigger, st.rightTrigger, st.lx, st.ly, st.rx, st.ry)
         }
-        gamepads.onFirstPad = { name -> Toast.makeText(this, "手柄已连接：$name（电脑上是虚拟 Xbox 手柄）", Toast.LENGTH_SHORT).show() }
-        inputManager.registerInputDeviceListener(padListener, main)
+        gamepads.onFirstPad = { name -> Toast.makeText(this, "手柄已连接：$name（被控端上是虚拟 Xbox 手柄）", Toast.LENGTH_SHORT).show() }
+        gamepads.onCount = { n -> ui.gamepadCount = n }
+        inputManager.registerInputDeviceListener(deviceListener, main)
+        checkMouse()
         val density = resources.displayMetrics.density
         gestures = GestureEngine(
             viewport,
@@ -175,7 +195,7 @@ class SessionActivity : ComponentActivity(), SessionActions {
             }
         })
 
-        decoders = DecoderCaps.detect()
+        decoders = DecoderCaps.detect(settings.hwDecode)
         connect()
     }
 
@@ -223,6 +243,11 @@ class SessionActivity : ComponentActivity(), SessionActions {
             if (open) viewport.ensureVisible(gestures.cursorX, gestures.cursorY, 48 * resources.displayMetrics.density)
             insets
         }
+
+        // A locked (captured) mouse reports relative movement, to whichever view has the focus.
+        root.isFocusableInTouchMode = true
+        root.setOnCapturedPointerListener { _, ev -> onCapturedMouse(ev) }
+        keyboardView.setOnCapturedPointerListener { _, ev -> onCapturedMouse(ev) }
     }
 
     // ------------------------------------------------------------ connection
@@ -253,29 +278,29 @@ class SessionActivity : ComponentActivity(), SessionActions {
         return screen && decoders.any { it.tenBit }
     }
 
-    private fun currentStreamOptions() = settingsStore.load().let { s ->
-        val size = screenSize()
-        streamOptions(s.copy(gameMode = ui.gameMode), size.x, size.y, refreshRate(), hdrCapable(), ui.displayId)
-    }
+    private fun currentStreamOptions() = screenSize().let { size -> streamOptions(sd, size.x, size.y, refreshRate(), hdrCapable()) }
 
     private fun connect() {
-        val s = settingsStore.load()
-        val config = StartConfig(
-            address = host.address,
-            pinned = host.fingerprint,
-            pairCode = pairCode,
-            clientName = "${Build.MANUFACTURER} ${Build.MODEL}".trim(),
+        val book = hosts.book()
+        val saved = book.byAddress(address)
+        val s = sd
+        val start = StartConfig(
+            address = address,
+            pinned = if (reverify) null else saved?.fingerprint,
+            clientName = config.effectiveClientName,
             clientVersion = BuildConfig.VERSION_NAME,
             decoders = decoders.map { it.cap() } + decoders.filter { it.tenBit && hdrCapable() }.map { it.tenBitCap() },
-            maxFps = minOf(refreshRate(), s.maxFps),
+            maxFps = fpsLimit(s, refreshRate()),
             stream = currentStreamOptions(),
             downloadDir = Downloads.receiveDir(this).absolutePath,
-            shares = if (Shares.accessGranted()) s.shares else emptyList(),
+            shares = if (Shares.accessGranted()) s.sharedFolders else emptyList(),
+            reverify = reverify,
         )
-        pairCode = null
         ui.status = Status.Connecting
+        ui.pinChanged = null
+        ui.verifyFingerprint = null
         val sess = try {
-            RemoteSession(filesDir.absolutePath, config, ::onEvent)
+            RemoteSession(filesDir.absolutePath, start, ::onEvent)
         } catch (e: Exception) {
             ui.status = Status.Disconnected(e.message ?: e.toString())
             return
@@ -289,69 +314,99 @@ class SessionActivity : ComponentActivity(), SessionActions {
         when (e) {
             CoreEvent.Connecting -> ui.status = Status.Connecting
             CoreEvent.NeedPairing -> ui.needPairing = true
-            is CoreEvent.Connected -> {
-                ui.status = Status.Connected
-                ui.needPairing = false
-                ui.fileTransfer = e.fileTransfer
-                ui.gamepad = e.gamepad
-                ui.usb = e.usb
-                keys.textInput = e.textInput
-                clipboard.images = e.clipboardImage
-                clipboard.files = e.clipboardFiles
-                micFeature = e.microphone
-                host = host.copy(
-                    fingerprint = e.fingerprint,
-                    fingerprintShort = e.fingerprintShort,
-                    lastConnected = System.currentTimeMillis(),
-                    name = host.name.ifBlank { e.serverName },
-                )
-                hosts.put(host)
-                if (ui.hostName.isBlank() || ui.hostName == host.address) ui.hostName = host.displayName
-                if (ui.showGuideOnConnect && !guideShown) {
-                    guideShown = true
-                    ui.guideOpen = true
-                }
-            }
+            is CoreEvent.VerifyFingerprint -> ui.verifyFingerprint = e.fingerprint
+            is CoreEvent.Connected -> onConnected(e)
             is CoreEvent.Reconnecting -> ui.status = Status.Reconnecting(e.message)
             is CoreEvent.Disconnected -> {
                 ui.needPairing = false
+                ui.verifyFingerprint = null
+                ui.status = Status.Disconnected(e.message)
+            }
+            is CoreEvent.PinChanged -> {
+                ui.needPairing = false
+                ui.pinChanged = e.message
                 ui.status = Status.Disconnected(e.message)
             }
             is CoreEvent.SessionInfo -> {
-                if (e.hostName.isNotBlank()) ui.hostName = host.name.ifBlank { e.hostName }
                 ui.displays = e.displays
-                ui.micAvailable = micFeature && e.micDevice.isNotBlank()
-                if (ui.micAvailable && settingsStore.load().mic && mic == null) toggleMic()
+                ui.vdAvailable = e.virtualDisplayAvailable
+                ui.micDevice = e.micDevice
+                if (ui.micAvailable && sd.mic && mic == null && !micPaused) toggleMic(keep = false)
             }
             is CoreEvent.StreamStarted -> {
                 ui.stream = e
+                ui.notice = ""
                 cursorView.setSource(e.sourceWidth, e.sourceHeight)
                 streamHdr = e.hdr
                 decoder?.hdr = e.hdr
             }
-            is CoreEvent.StreamError -> Toast.makeText(this, e.message, Toast.LENGTH_LONG).show()
+            is CoreEvent.StreamError -> {
+                ui.notice = ""
+                Toast.makeText(this, e.message, Toast.LENGTH_LONG).show()
+            }
             is CoreEvent.Role -> ui.role = e
             is CoreEvent.CursorShape -> cursorView.addShape(e.id, e.width, e.height, e.hotX, e.hotY, e.rgbaBase64)
             is CoreEvent.CursorState -> {
                 cursorView.setState(e.shapeId, e.visible, e.x, e.y)
                 cursorView.remotePosition()?.let { (rx, ry) -> gestures.hostCursor(rx, ry) }
             }
-            is CoreEvent.Clipboard -> if (settingsStore.load().syncClipboard) clipboard.fromHostText(e.text)
-            is CoreEvent.ClipboardImage -> if (settingsStore.load().syncClipboard) {
-                if (clipboard.fromHostImage(e.path)) Toast.makeText(this, "已复制电脑上的图片", Toast.LENGTH_SHORT).show()
+            is CoreEvent.Clipboard -> if (sd.clipboard) clipboard.fromHostText(e.text)
+            is CoreEvent.ClipboardImage -> if (sd.clipboard) {
+                if (clipboard.fromHostImage(e.path)) Toast.makeText(this, "已复制被控端的图片", Toast.LENGTH_SHORT).show()
             }
-            is CoreEvent.PrintJob -> ui.printJob = e.path
+            is CoreEvent.PrintJob -> when (sd.printMode) {
+                "ask" -> ui.printJob = e.path
+                else -> handlePrint(File(e.path), sd.printMode)
+            }
             is CoreEvent.FolderMount -> {
                 ui.folderMount = e
                 if (!e.mounted && e.message.isNotBlank()) Toast.makeText(this, e.message, Toast.LENGTH_LONG).show()
             }
             is CoreEvent.UsbStatus -> usbSharing.status(e.busid, e.attached, e.message)
             is CoreEvent.Stats -> ui.stats = e.line
-            is CoreEvent.FileOffer -> ui.offer = e
+            is CoreEvent.FileOffer -> if (sd.clipboard) {
+                ui.offers.removeAll { it.id == e.id }
+                ui.offers += e
+            }
             is CoreEvent.Transfer -> onTransfer(e)
             is CoreEvent.FilesReceived -> saveReceived(e)
             is CoreEvent.Rumble -> gamepads.rumble(e.index, e.large, e.small) { InputDevice.getDevice(it) }
         }
+    }
+
+    private fun onConnected(e: CoreEvent.Connected) {
+        ui.status = Status.Connected
+        ui.needPairing = false
+        ui.verifyFingerprint = null
+        reverify = false
+        ui.fileTransfer = e.fileTransfer
+        ui.gamepad = e.gamepad
+        ui.usb = e.usb
+        ui.micFeature = e.microphone
+        ui.vdSupported = e.virtualDisplay
+        keys.textInput = e.textInput
+        clipboard.images = e.clipboardImage
+        clipboard.files = e.clipboardFiles
+        // Saved (or added) under the name the host gives itself unless named here.
+        val wasSaved = hosts.book().byAddress(address) != null
+        val book = hosts.change { b ->
+            var (nb, h) = b.connected(address, e.serverName, e.fingerprint, e.fingerprintShort, System.currentTimeMillis())
+            val name = newName
+            if (!wasSaved && name != null) nb = runCatching { nb.rename(h.id, name) }.getOrDefault(nb)
+            nb
+        }
+        newName = null
+        book.byAddress(address)?.let { ui.hostName = it.displayName }
+        if (ui.showGuideOnConnect && !guideShown) {
+            guideShown = true
+            ui.guideOpen = true
+        }
+    }
+
+    /** A setting changed during the session: keep it for this host (its own settings from now on). */
+    private fun remember(f: (ConnSettings) -> ConnSettings) {
+        sd = f(sd)
+        hosts.change { it.editSettings(address, config.defaults, f) }
     }
 
     private fun startDecoder() {
@@ -374,22 +429,33 @@ class SessionActivity : ComponentActivity(), SessionActions {
     }
 
     private fun onTransfer(e: CoreEvent.Transfer) {
-        ui.transfer = e
-        if (e.finished) {
-            if (!e.ok || e.upload) Toast.makeText(this, e.message, Toast.LENGTH_LONG).show()
-            main.postDelayed({ if (ui.transfer === e) ui.transfer = null }, 3000)
+        val i = ui.transfers.indexOfFirst { it.t.id == e.id && it.t.upload == e.upload }
+        if (i >= 0) ui.transfers[i] = ui.transfers[i].copy(t = e) else ui.transfers += TransferItem(e)
+        while (ui.transfers.size > 8) {
+            val old = ui.transfers.indexOfFirst { it.t.finished }
+            if (old < 0) break
+            ui.transfers.removeAt(old)
+        }
+        // Finished uploads go away on their own after a while; downloads stay until saved.
+        if (e.finished && e.upload && e.ok) {
+            main.postDelayed({ ui.transfers.removeAll { it.t.id == e.id && it.t.upload && it.t.finished } }, 8000)
         }
     }
 
     private fun saveReceived(e: CoreEvent.FilesReceived) {
-        val files = e.paths.map { java.io.File(it) }
+        val files = e.paths.map { File(it) }
         thread(name = "nya-save") {
-            val msg = try {
-                "已保存 ${files.size} 个文件到 ${Downloads.saveAll(this, files)}"
-            } catch (ex: Exception) {
-                "保存文件失败：${ex.message}"
+            val r = runCatching { Downloads.saveAll(this, files) }
+            main.post {
+                val i = ui.transfers.indexOfFirst { it.t.id == e.id && !it.t.upload }
+                r.onSuccess { where ->
+                    if (i >= 0) {
+                        ui.transfers[i] = ui.transfers[i].copy(savedTo = where)
+                    } else {
+                        Toast.makeText(this, "已保存 ${files.size} 个文件到 $where", Toast.LENGTH_LONG).show()
+                    }
+                }.onFailure { ex -> Toast.makeText(this, "保存文件失败：${ex.message}", Toast.LENGTH_LONG).show() }
             }
-            main.post { Toast.makeText(this, msg, Toast.LENGTH_LONG).show() }
         }
     }
 
@@ -423,6 +489,28 @@ class SessionActivity : ComponentActivity(), SessionActions {
         session?.sendFiles(picked.toString())
     }
 
+    /** A print job from the host: print, open in another app, or save. */
+    private fun handlePrint(f: File, how: String) {
+        when (how) {
+            "print" -> PdfPrint.print(this, f)
+            "open" -> try {
+                val uri = FileProvider.getUriForFile(this, "$packageName.files", f)
+                startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uri, "application/pdf").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
+            } catch (_: Exception) {
+                Toast.makeText(this, "没有能打开 PDF 的应用，已改为保存", Toast.LENGTH_LONG).show()
+                handlePrint(f, "save")
+            }
+            else -> thread(name = "nya-save") {
+                val msg = try {
+                    "打印内容已保存到 ${Downloads.saveAll(this, listOf(f))}"
+                } catch (ex: Exception) {
+                    "保存失败：${ex.message}"
+                }
+                main.post { Toast.makeText(this, msg, Toast.LENGTH_LONG).show() }
+            }
+        }
+    }
+
     private fun startMic() {
         val s = session ?: return
         if (mic != null) return
@@ -434,14 +522,12 @@ class SessionActivity : ComponentActivity(), SessionActions {
             }
         }.also { it.start() }
         ui.micOn = true
-        settingsStore.update { it.copy(mic = true) }
     }
 
-    private fun stopMic(remember: Boolean = true) {
+    private fun stopMic() {
         mic?.stop()
         mic = null
         ui.micOn = false
-        if (remember) settingsStore.update { it.copy(mic = false) }
     }
 
     /** The microphone was on when the app went to the background: on again when it returns. */
@@ -467,13 +553,16 @@ class SessionActivity : ComponentActivity(), SessionActions {
 
     private fun closeSession() {
         micPaused = false
-        stopMic(remember = false)
-
+        stopMic()
+        setMouseLock(false)
         if (::usbSharing.isInitialized) usbSharing.releaseAll()
         if (::gamepads.isInitialized) gamepads.clear()
         stopDecoder()
         audio?.stop()
         audio = null
+        ui.offers.clear()
+        ui.transfers.clear()
+        ui.notice = ""
         val s = session ?: return
         session = null
         thread(name = "nya-close") { s.close() }
@@ -481,7 +570,7 @@ class SessionActivity : ComponentActivity(), SessionActions {
 
     override fun onDestroy() {
         main.removeCallbacksAndMessages(null)
-        if (::gamepads.isInitialized) inputManager.unregisterInputDeviceListener(padListener)
+        if (::gamepads.isInitialized) inputManager.unregisterInputDeviceListener(deviceListener)
         if (::usbSharing.isInitialized) usbSharing.close()
         keyOut.shutdown()
         if (::ui.isInitialized) closeSession()
@@ -490,18 +579,20 @@ class SessionActivity : ComponentActivity(), SessionActions {
 
     // ------------------------------------------------------------ input
 
+    /** Touch gestures turned into host input; a watcher's gestures only pan and zoom here. */
     private val remoteInput = object : RemoteInput {
         override fun moveTo(rx: Float, ry: Float) {
+            if (ui.watching) return
             session?.mouseTo(rx, ry)
             cursorView.moveLocal(rx, ry)
         }
 
         override fun button(button: Int, down: Boolean) {
-            session?.mouseButton(button, down)
+            if (!ui.watching) session?.mouseButton(button, down)
         }
 
         override fun wheel(dx: Int, dy: Int) {
-            session?.wheel(dx, dy)
+            if (!ui.watching) session?.wheel(dx, dy)
         }
 
         override fun toggleKeyboard() = this@SessionActivity.toggleKeyboard()
@@ -540,18 +631,56 @@ class SessionActivity : ComponentActivity(), SessionActions {
     private var mouseButtons = 0
 
     private fun onMouse(ev: MotionEvent): Boolean {
+        if (ui.watching) return true
         val (rx, ry) = viewport.toRemote(ev.x, ev.y)
         when (ev.actionMasked) {
             MotionEvent.ACTION_HOVER_MOVE, MotionEvent.ACTION_MOVE, MotionEvent.ACTION_DOWN, MotionEvent.ACTION_UP,
             MotionEvent.ACTION_BUTTON_PRESS, MotionEvent.ACTION_BUTTON_RELEASE,
             -> remoteInput.moveTo(rx, ry)
-            MotionEvent.ACTION_SCROLL -> {
-                val v = ev.getAxisValue(MotionEvent.AXIS_VSCROLL)
-                val h = ev.getAxisValue(MotionEvent.AXIS_HSCROLL)
-                session?.wheel((h * 120).roundToInt(), (v * 120).roundToInt())
-            }
+            MotionEvent.ACTION_SCROLL -> wheel(ev)
         }
-        val now = ev.buttonState
+        buttons(ev.buttonState)
+        return true
+    }
+
+    /** Locked mouse: movement as it comes (relative), buttons and wheel as usual. */
+    private fun onCapturedMouse(ev: MotionEvent): Boolean {
+        if (ui.watching) return true
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_MOVE, MotionEvent.ACTION_HOVER_MOVE -> {
+                // Captured pointers report deltas in x / y (history included).
+                var dx = 0f
+                var dy = 0f
+                for (h in 0 until ev.historySize) {
+                    dx += ev.getHistoricalX(h)
+                    dy += ev.getHistoricalY(h)
+                }
+                dx += ev.x
+                dy += ev.y
+                relX += dx
+                relY += dy
+                val sx = relX.toInt()
+                val sy = relY.toInt()
+                relX -= sx
+                relY -= sy
+                if (sx != 0 || sy != 0) session?.mouseBy(sx, sy)
+            }
+            MotionEvent.ACTION_SCROLL -> wheel(ev)
+        }
+        buttons(ev.buttonState)
+        return true
+    }
+
+    private var relX = 0f
+    private var relY = 0f
+
+    private fun wheel(ev: MotionEvent) {
+        val v = ev.getAxisValue(MotionEvent.AXIS_VSCROLL)
+        val h = ev.getAxisValue(MotionEvent.AXIS_HSCROLL)
+        session?.wheel((h * 120).roundToInt(), (v * 120).roundToInt())
+    }
+
+    private fun buttons(now: Int) {
         for ((mask, button) in listOf(
             MotionEvent.BUTTON_PRIMARY to NativeCore.BUTTON_LEFT,
             MotionEvent.BUTTON_SECONDARY to NativeCore.BUTTON_RIGHT,
@@ -560,15 +689,27 @@ class SessionActivity : ComponentActivity(), SessionActions {
             if ((now and mask) != (mouseButtons and mask)) session?.mouseButton(button, now and mask != 0)
         }
         mouseButtons = now
-        return true
+    }
+
+    private fun checkMouse() {
+        ui.mouseConnected = InputDevice.getDeviceIds().any { id ->
+            InputDevice.getDevice(id)?.let { !it.isVirtual && it.supportsSource(InputDevice.SOURCE_MOUSE) } == true
+        }
+        if (!ui.mouseConnected && ui.mouseLocked) setMouseLock(false)
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        // The system drops the capture when the window loses focus; take it again on return.
+        if (hasFocus && ui.mouseLocked && !root.hasPointerCapture()) root.requestPointerCapture()
     }
 
     // Hardware keyboards; the soft keyboard goes through RemoteKeyboardView's input connection.
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean =
-        (ui.gamepad && gamepads.onKey(event)) || (fromKeyboard(event) && keys.key(keyCode, true)) || super.onKeyDown(keyCode, event)
+        (ui.gamepad && gamepads.onKey(event)) || (fromKeyboard(event) && !ui.watching && keys.key(keyCode, true)) || super.onKeyDown(keyCode, event)
 
     override fun onKeyUp(keyCode: Int, event: KeyEvent): Boolean =
-        (ui.gamepad && gamepads.onKey(event)) || (fromKeyboard(event) && keys.key(keyCode, false)) || super.onKeyUp(keyCode, event)
+        (ui.gamepad && gamepads.onKey(event)) || (fromKeyboard(event) && !ui.watching && keys.key(keyCode, false)) || super.onKeyUp(keyCode, event)
 
     // Controller sticks and triggers (pointer events are handled by the layout).
     override fun onGenericMotionEvent(event: MotionEvent): Boolean =
@@ -606,9 +747,8 @@ class SessionActivity : ComponentActivity(), SessionActions {
     // ------------------------------------------------------------ SessionActions
 
     override fun setControlMode(mode: ControlMode) {
-        ui.controlMode = mode
         gestures.mode = mode
-        settingsStore.update { it.copy(controlMode = mode) }
+        remember { it.copy(controlMode = mode) }
     }
 
     /** The keyboard was asked for (insets tell the truth on Android 11+ only). */
@@ -622,10 +762,11 @@ class SessionActivity : ComponentActivity(), SessionActions {
         }
 
     override fun toggleKeyboard() {
+        if (ui.watching) return
         when {
             ui.pcKeyboardOpen -> hidePcKeyboard()
             imeVisible() || ui.keyboardOpen -> hideKeyboard()
-            settingsStore.load().pcKeyboard -> showPcKeyboard()
+            sd.pcKeyboard -> showPcKeyboard()
             else -> showKeyboard()
         }
     }
@@ -638,7 +779,8 @@ class SessionActivity : ComponentActivity(), SessionActions {
             hideKeyboard()
             showPcKeyboard()
         }
-        settingsStore.update { it.copy(pcKeyboard = ui.pcKeyboardOpen) }
+        val pc = ui.pcKeyboardOpen
+        remember { it.copy(pcKeyboard = pc) }
     }
 
     private fun showPcKeyboard() {
@@ -686,19 +828,27 @@ class SessionActivity : ComponentActivity(), SessionActions {
     }
 
     override fun setGameMode(game: Boolean) {
-        ui.gameMode = game
+        if (sd.game == game) return
+        remember { it.copy(mode = if (game) "game" else "office") }
         session?.setGameMode(game)
-        settingsStore.update { it.copy(gameMode = game) }
+        ui.notice = if (game) "正在切换到游戏模式…" else "正在切换到办公模式…"
+    }
+
+    override fun setPolicy(policy: String) {
+        if (sd.bitratePolicy == policy) return
+        remember { it.copy(bitratePolicy = policy) }
+        session?.updateStream(currentStreamOptions())
+        ui.notice = "正在切换码率策略…"
     }
 
     override fun setShowStats(show: Boolean) {
         ui.showStats = show
-        settingsStore.update { it.copy(showStats = show) }
+        config = configStore.update { it.copy(showStats = show) }
     }
 
     override fun setShowGuideOnConnect(show: Boolean) {
         ui.showGuideOnConnect = show
-        settingsStore.update { it.copy(showGuideOnConnect = show) }
+        config = configStore.update { it.copy(showGuideOnConnect = show) }
     }
 
     override fun sendSas() {
@@ -716,13 +866,38 @@ class SessionActivity : ComponentActivity(), SessionActions {
     }
 
     override fun pickDisplay(id: Int) {
-        if (ui.displayId == id) return
-        ui.displayId = id
+        if (ui.currentDisplay == id) return
+        remember { it.copy(display = id) }
         session?.updateStream(currentStreamOptions())
+        ui.notice = "正在切换显示器…"
     }
 
-    override fun toggleMic() {
-        if (mic != null) return stopMic()
+    override fun setDisplayChoice(c: DisplayChoice) {
+        val was = sd.displayChoice
+        if (c == was) return
+        remember { it.withDisplayChoice(c) }
+        session?.updateStream(currentStreamOptions())
+        val now = sd.displayChoice
+        ui.notice = when {
+            now.count > was.count -> "正在新建虚拟显示器…"
+            now.count < was.count && now.count == 0 -> "正在移除虚拟显示器…"
+            now.count < was.count -> "正在减少虚拟显示器…"
+            now.physicalOff != was.physicalOff -> if (now.physicalOff) "正在关闭被控端的物理显示器…" else "正在打开被控端的物理显示器…"
+            else -> if (now.blockInput) "已屏蔽被控端本地键盘鼠标" else "已恢复被控端本地键盘鼠标"
+        }
+        if (now.count == was.count && now.physicalOff == was.physicalOff) main.postDelayed({ ui.notice = "" }, 2500)
+    }
+
+    override fun toggleMic() = toggleMic(keep = true)
+
+    /** [keep]: remember the choice for this host. */
+    private fun toggleMic(keep: Boolean) {
+        if (mic != null) {
+            stopMic()
+            if (keep) remember { it.copy(mic = false) }
+            return
+        }
+        if (keep) remember { it.copy(mic = true) }
         if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) == android.content.pm.PackageManager.PERMISSION_GRANTED) {
             startMic()
         } else {
@@ -730,24 +905,27 @@ class SessionActivity : ComponentActivity(), SessionActions {
         }
     }
 
+    override fun setMouseLock(on: Boolean) {
+        if (!::root.isInitialized) return
+        ui.mouseLocked = on
+        relX = 0f
+        relY = 0f
+        if (on) {
+            ui.panelOpen = false
+            if (!keyboardView.hasFocus()) root.requestFocus()
+            root.requestPointerCapture()
+            Toast.makeText(this, "鼠标已锁定在画面里；在面板里可以解除", Toast.LENGTH_SHORT).show()
+        } else if (root.hasPointerCapture()) {
+            root.releasePointerCapture()
+        }
+    }
+
     override fun toggleUsb(item: UsbSharing.Item) = usbSharing.toggle(item)
 
-    override fun printJob(print: Boolean) {
+    override fun printJob(how: String?) {
         val path = ui.printJob ?: return
         ui.printJob = null
-        val f = java.io.File(path)
-        if (print) {
-            PdfPrint.print(this, f)
-        } else {
-            thread(name = "nya-save") {
-                val msg = try {
-                    "已保存到 ${Downloads.saveAll(this, listOf(f))}"
-                } catch (ex: Exception) {
-                    "保存失败：${ex.message}"
-                }
-                main.post { Toast.makeText(this, msg, Toast.LENGTH_LONG).show() }
-            }
-        }
+        if (how != null) handlePrint(File(path), how)
     }
 
     override fun takeControl(kick: Boolean) {
@@ -762,6 +940,19 @@ class SessionActivity : ComponentActivity(), SessionActions {
         session?.providePairCode(code?.trim())
     }
 
+    override fun checkAgain(retry: Boolean) {
+        ui.pinChanged = null
+        if (!retry) return disconnect()
+        reverify = true
+        closeSession()
+        connect()
+    }
+
+    override fun confirmFingerprint(ok: Boolean) {
+        ui.verifyFingerprint = null
+        session?.confirmFingerprint(ok)
+    }
+
     override fun retry() {
         closeSession()
         connect()
@@ -772,14 +963,25 @@ class SessionActivity : ComponentActivity(), SessionActions {
         filePicker.launch(arrayOf("*/*"))
     }
 
-    override fun acceptOffer() {
-        val o = ui.offer ?: return
-        ui.offer = null
-        session?.requestFiles(o.id)
+    override fun acceptOffer(id: String) {
+        ui.offers.removeAll { it.id == id }
+        session?.requestFiles(id)
     }
 
-    override fun dismissOffer() {
-        ui.offer = null
+    override fun dismissOffer(id: String) {
+        ui.offers.removeAll { it.id == id }
+    }
+
+    override fun dismissTransfer(id: String) {
+        ui.transfers.removeAll { it.t.id == id && it.t.finished }
+    }
+
+    override fun openDownloads() {
+        try {
+            startActivity(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        } catch (_: Exception) {
+            Toast.makeText(this, "文件在“下载/${Downloads.FOLDER}”里", Toast.LENGTH_LONG).show()
+        }
     }
 
     override fun disconnect() {
@@ -790,10 +992,11 @@ class SessionActivity : ComponentActivity(), SessionActions {
     }
 
     companion object {
-        const val EXTRA_HOST_ID = "host"
-        const val EXTRA_PAIR_CODE = "pairCode"
+        const val EXTRA_ADDRESS = "address"
+        const val EXTRA_NAME = "name"
 
-        fun intent(context: Context, hostId: String, pairCode: String?) =
-            Intent(context, SessionActivity::class.java).putExtra(EXTRA_HOST_ID, hostId).putExtra(EXTRA_PAIR_CODE, pairCode)
+        /** Connect to [address]; [name] names a host that is not saved yet. */
+        fun intent(context: Context, address: String, name: String?) =
+            Intent(context, SessionActivity::class.java).putExtra(EXTRA_ADDRESS, address).putExtra(EXTRA_NAME, name)
     }
 }

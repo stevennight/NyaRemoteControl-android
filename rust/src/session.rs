@@ -65,6 +65,7 @@ pub struct Shared {
     pub stats: Stats,
     pub cmds: mpsc::UnboundedSender<NetCmd>,
     pair_reply: Mutex<Option<std::sync::mpsc::Sender<Option<String>>>>,
+    verify_reply: Mutex<Option<std::sync::mpsc::Sender<bool>>>,
     /// Host audio after decoding (the app decodes Opus with MediaCodec).
     pub jitter: Mutex<JitterBuffer>,
     /// Local clock for the jitter buffer.
@@ -142,6 +143,14 @@ impl Shared {
         self.event(Event::NeedPairing);
         rx.recv_timeout(Duration::from_secs(600)).ok().flatten()
     }
+
+    /// Show the host's fingerprint and wait for the user's answer (blocking).
+    pub fn ask_fingerprint_ok(&self, fingerprint: String) -> bool {
+        let (tx, rx) = std::sync::mpsc::channel();
+        *self.verify_reply.lock().unwrap() = Some(tx);
+        self.event(Event::VerifyFingerprint { fingerprint });
+        rx.recv_timeout(Duration::from_secs(600)).unwrap_or(false)
+    }
 }
 
 pub enum Next<T> {
@@ -191,6 +200,7 @@ impl Session {
             stats: Stats::default(),
             cmds: cmds_tx,
             pair_reply: Mutex::new(None),
+            verify_reply: Mutex::new(None),
             jitter: Mutex::new(JitterBuffer::new()),
             epoch: Instant::now(),
             clip_out: Mutex::new(Default::default()),
@@ -233,6 +243,12 @@ impl Session {
     pub fn provide_pair_code(&self, code: Option<String>) {
         if let Some(tx) = self.shared.pair_reply.lock().unwrap().take() {
             let _ = tx.send(code);
+        }
+    }
+
+    pub fn confirm_fingerprint(&self, ok: bool) {
+        if let Some(tx) = self.shared.verify_reply.lock().unwrap().take() {
+            let _ = tx.send(ok);
         }
     }
 

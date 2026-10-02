@@ -231,6 +231,7 @@ fn pairs_streams_and_resyncs_on_gaps() {
             path: dir.join("share").to_string_lossy().into_owned(),
             read_only: true,
         }],
+        reverify: false,
     };
     let session = Session::start(&dir, cfg).unwrap();
 
@@ -278,5 +279,76 @@ fn pairs_streams_and_resyncs_on_gaps() {
     let vs = &seen.start.display_setup.unwrap().virtual_screens[0];
     assert_eq!((vs.width, vs.height, vs.scale_percent), (2400, 1080, 150));
     drop(session);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A host that already knows every client (no pairing): accepts connections
+/// and reads control messages until the client goes away.
+async fn known_client_host(endpoint: nya_transport::quinn::Endpoint) {
+    while let Some(incoming) = endpoint.accept().await {
+        tokio::spawn(async move {
+            let Ok(conn) = incoming.await else { return };
+            let Ok((mut send, mut recv)) = conn.accept_bi().await else { return };
+            let Ok(hello) = expect_msg::<pb::Hello, _>(&mut recv, MAX_MESSAGE_LEN).await else { return };
+            let neg = negotiate::negotiate(&hello, &LocalVersion::current()).unwrap();
+            let welcome = pb::Welcome {
+                proto_major: neg.major,
+                proto_minor: neg.minor,
+                server_name: "known".into(),
+                server_version: "0.0.0".into(),
+                features: neg.features.iter().copied().collect(),
+                needs_pairing: false,
+            };
+            let _ = write_msg(&mut send, &pb::HelloReply { reply: Some(pb::hello_reply::Reply::Welcome(welcome)) }).await;
+            while let Ok(Some(_)) = read_msg::<pb::ControlMsg, _>(&mut recv, MAX_MESSAGE_LEN).await {}
+        });
+    }
+}
+
+#[test]
+fn changed_certificate_is_reported_then_verified_by_fingerprint() {
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+    let host_id = Identity::generate().unwrap();
+    let endpoint = rt.block_on(async { nya_transport::endpoint::server_endpoint("127.0.0.1:0".parse().unwrap(), &host_id) }).unwrap();
+    let addr = endpoint.local_addr().unwrap();
+    rt.spawn(known_client_host(endpoint));
+    let dir = std::env::temp_dir().join(format!("nya-android-pin-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = |pinned: Option<String>, reverify: bool| StartConfig {
+        address: addr.to_string(),
+        pinned,
+        pair_code: None,
+        client_name: "test phone".into(),
+        client_version: "0.0.0".into(),
+        decoders: vec![],
+        max_fps: 60,
+        stream: StreamOptions::default(),
+        download_dir: None,
+        shares: vec![],
+        reverify,
+    };
+
+    // Pinned to another certificate: not a plain failure, the app can re-check.
+    let other = Identity::generate().unwrap().fingerprint().to_hex();
+    let s = Session::start(&dir, cfg(Some(other), false)).unwrap();
+    wait_event(&s, |e| matches!(e, Event::PinChanged { .. }));
+    drop(s);
+
+    // Checked again without the pin: the fingerprint is shown first.
+    for ok in [false, true] {
+        let s = Session::start(&dir, cfg(None, true)).unwrap();
+        let Event::VerifyFingerprint { fingerprint } = wait_event(&s, |e| matches!(e, Event::VerifyFingerprint { .. })) else { unreachable!() };
+        assert_eq!(fingerprint, host_id.fingerprint().short());
+        s.confirm_fingerprint(ok);
+        if ok {
+            let Event::Connected { server_fingerprint, .. } = wait_event(&s, |e| matches!(e, Event::Connected { .. })) else { unreachable!() };
+            assert_eq!(server_fingerprint, host_id.fingerprint().to_hex());
+            s.stop();
+        } else {
+            let Event::Disconnected { message } = wait_event(&s, |e| matches!(e, Event::Disconnected { .. })) else { unreachable!() };
+            assert!(message.contains("未确认"), "{message}");
+        }
+        drop(s);
+    }
     let _ = std::fs::remove_dir_all(dir);
 }
