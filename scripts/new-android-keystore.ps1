@@ -76,12 +76,25 @@ if ($SetGitHubSecrets) {
     if (-not $gh) { throw 'gh (GitHub CLI) not found.' }
     $v = Read-Info
     $b64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes($keystore))
-    # Values go through stdin, not the command line.
-    $b64 | & $gh.Source secret set ANDROID_KEYSTORE_BASE64 --repo $Repo
-    $v['ANDROID_KEYSTORE_PASSWORD'] | & $gh.Source secret set ANDROID_KEYSTORE_PASSWORD --repo $Repo
-    $v['ANDROID_KEY_ALIAS'] | & $gh.Source secret set ANDROID_KEY_ALIAS --repo $Repo
-    $v['ANDROID_KEY_PASSWORD'] | & $gh.Source secret set ANDROID_KEY_PASSWORD --repo $Repo
-    if ($LASTEXITCODE -ne 0) { throw "gh secret set failed with exit code $LASTEXITCODE" }
+    $secrets = [ordered]@{
+        ANDROID_KEYSTORE_BASE64   = $b64
+        ANDROID_KEYSTORE_PASSWORD = $v['ANDROID_KEYSTORE_PASSWORD']
+        ANDROID_KEY_ALIAS         = $v['ANDROID_KEY_ALIAS']
+        ANDROID_KEY_PASSWORD      = $v['ANDROID_KEY_PASSWORD']
+    }
+    foreach ($name in $secrets.Keys) {
+        # Values go through stdin, not the command line. GitHub sometimes answers 5xx: retry.
+        $ok = $false
+        foreach ($attempt in 1..4) {
+            $ErrorActionPreference = 'Continue'
+            $secrets[$name] | & $gh.Source secret set $name --repo $Repo 2>&1 | Out-Null
+            $ErrorActionPreference = 'Stop'
+            if ($LASTEXITCODE -eq 0) { $ok = $true; break }
+            Start-Sleep -Seconds ([math]::Pow(2, $attempt))
+        }
+        if (-not $ok) { throw "could not set secret $name on $Repo" }
+        Write-Host "  $name set"
+    }
     Write-Host "Actions secrets set on $Repo" -ForegroundColor Green
 }
 
