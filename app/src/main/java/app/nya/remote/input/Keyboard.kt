@@ -47,7 +47,28 @@ class KeyboardController(
         if (sticky.isNotEmpty()) sticky = emptySet()
     }
 
+    /** Modifiers that went down with the key being held (PC keyboard). */
+    private var heldMods: List<ScanKey> = emptyList()
+
+    /** A key goes down (PC keyboard): latched modifiers go down first. */
+    fun press(k: ScanKey) {
+        heldMods = sticky.toList()
+        heldMods.forEach { send(it, true) }
+        send(k, true)
+    }
+
+    /** Held key repeats (typematic: repeated key-down). */
+    fun repeat(k: ScanKey) = send(k, true)
+
+    fun release(k: ScanKey) {
+        send(k, false)
+        heldMods.asReversed().forEach { send(it, false) }
+        if (heldMods.isNotEmpty()) sticky = emptySet()
+        heldMods = emptyList()
+    }
+
     /** A shortcut: press in order, release in reverse. */
+
     fun combo(vararg keys: ScanKey) {
         keys.forEach { send(it, true) }
         keys.reversed().forEach { send(it, false) }

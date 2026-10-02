@@ -18,7 +18,19 @@ class InputFeaturesTest {
     )
 
     @Test
+    fun pcKeyboardHoldsKeysAndUsesLatchedModifiers() {
+        keys.toggleSticky(KeyMap.LCTRL)
+        keys.press(ScanKey(0x2E)) // C
+        keys.repeat(ScanKey(0x2E))
+        keys.release(ScanKey(0x2E))
+        keys.press(ScanKey(0x2E)) // latch used up
+        keys.release(ScanKey(0x2E))
+        assertEquals(listOf("1dv", "2ev", "2ev", "2e^", "1d^", "2ev", "2e^"), log)
+    }
+
+    @Test
     fun chineseOnAnOldHostGoesThroughItsClipboard() {
+
         keys.textInput = false
         keys.type("你好")
         assertEquals(listOf("paste:你好"), log)

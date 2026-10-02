@@ -217,8 +217,9 @@ class SessionActivity : ComponentActivity(), SessionActions {
             val ime = insets.getInsets(WindowInsetsCompat.Type.ime()).bottom
             val open = insets.isVisible(WindowInsetsCompat.Type.ime()) || (Build.VERSION.SDK_INT < 30 && imeWanted)
             ui.keyboardOpen = open
+            // The PC keyboard sets the inset itself.
+            if (!ui.pcKeyboardOpen) viewport.setBottomInset(if (open) ime.toFloat() + 46 * resources.displayMetrics.density else 0f)
 
-            viewport.setBottomInset(if (open) ime.toFloat() + 46 * resources.displayMetrics.density else 0f)
             if (open) viewport.ensureVisible(gestures.cursorX, gestures.cursorY, 48 * resources.displayMetrics.density)
             insets
         }
@@ -598,7 +599,38 @@ class SessionActivity : ComponentActivity(), SessionActions {
         }
 
     override fun toggleKeyboard() {
-        if (imeVisible() || ui.keyboardOpen) hideKeyboard() else showKeyboard()
+        when {
+            ui.pcKeyboardOpen -> hidePcKeyboard()
+            imeVisible() || ui.keyboardOpen -> hideKeyboard()
+            settingsStore.load().pcKeyboard -> showPcKeyboard()
+            else -> showKeyboard()
+        }
+    }
+
+    override fun switchKeyboard() {
+        if (ui.pcKeyboardOpen) {
+            hidePcKeyboard()
+            showKeyboard()
+        } else {
+            hideKeyboard()
+            showPcKeyboard()
+        }
+        settingsStore.update { it.copy(pcKeyboard = ui.pcKeyboardOpen) }
+    }
+
+    private fun showPcKeyboard() {
+        ui.pcKeyboardOpen = true
+    }
+
+    private fun hidePcKeyboard() {
+        ui.pcKeyboardOpen = false
+        viewport.setBottomInset(0f)
+    }
+
+    override fun pcKeyboardHeight(px: Int) {
+        if (!ui.pcKeyboardOpen) return
+        viewport.setBottomInset(px.toFloat())
+        viewport.ensureVisible(gestures.cursorX, gestures.cursorY, 48 * resources.displayMetrics.density)
     }
 
     private fun showKeyboard() {

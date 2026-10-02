@@ -120,6 +120,13 @@ fun SettingsScreen(store: SettingsStore, onCheckUpdate: () -> Unit, onBack: () -
                     set { it.copy(controlMode = v) }
                 }
                 Toggle("连接时显示手势指引", s.showGuideOnConnect) { v -> set { it.copy(showGuideOnConnect = v) } }
+                Options(
+                    "键盘",
+                    listOf(false to "手机输入法", true to "电脑键盘"),
+                    s.pcKeyboard,
+                    hint = "电脑键盘：屏幕上的电脑布局键盘，按键直接发给电脑（游戏、快捷键、命令行更顺手）。键盘上可随时切换。",
+                ) { v -> set { it.copy(pcKeyboard = v) } }
+
             }
             Section("共享文件夹到电脑") {
                 Text("连接后这些文件夹出现在电脑上的一个盘符里（需要被控端装有 WinFsp）。", color = Color.Gray, fontSize = 12.sp)

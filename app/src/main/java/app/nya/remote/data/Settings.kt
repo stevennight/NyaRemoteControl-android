@@ -42,6 +42,8 @@ data class Settings(
     val bitratePolicy: String = "auto",
     /** HDR10 when the phone's screen, its decoder and the host can. */
     val hdr: Boolean = true,
+    /** The PC-layout on-screen keyboard instead of the phone's input method (remembered). */
+    val pcKeyboard: Boolean = false,
     /** Microphone on at connect (remembered from the panel). */
     val mic: Boolean = false,
     /** Phone folders shown on the host as a drive. */
@@ -70,6 +72,7 @@ class SettingsStore(private val prefs: SharedPreferences) {
             bitratePolicy = prefs.getString("bitratePolicy", d.bitratePolicy) ?: d.bitratePolicy,
             hdr = prefs.getBoolean("hdr", d.hdr),
             mic = prefs.getBoolean("mic", d.mic),
+            pcKeyboard = prefs.getBoolean("pcKeyboard", d.pcKeyboard),
             shares = prefs.getString("shares", null)?.let {
                 try {
                     Json.decodeFromString<List<ShareConfig>>(it)
@@ -98,6 +101,8 @@ class SettingsStore(private val prefs: SharedPreferences) {
             putString("bitratePolicy", s.bitratePolicy)
             putBoolean("hdr", s.hdr)
             putBoolean("mic", s.mic)
+            putBoolean("pcKeyboard", s.pcKeyboard)
+
             putString("shares", Json.encodeToString(s.shares))
         }
     }

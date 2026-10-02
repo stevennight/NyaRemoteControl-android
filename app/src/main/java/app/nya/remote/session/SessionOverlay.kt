@@ -88,6 +88,8 @@ class SessionUi(initialMode: ControlMode, showStats: Boolean, gameMode: Boolean,
     var shortcutsOpen by mutableStateOf(false)
     var guideOpen by mutableStateOf(false)
     var keyboardOpen by mutableStateOf(false)
+    /** The PC-layout keyboard is shown (instead of the phone's input method). */
+    var pcKeyboardOpen by mutableStateOf(false)
     var showStats by mutableStateOf(showStats)
     var gameMode by mutableStateOf(gameMode)
     var showGuideOnConnect by mutableStateOf(showGuideOnConnect)
@@ -116,6 +118,9 @@ class SessionUi(initialMode: ControlMode, showStats: Boolean, gameMode: Boolean,
 interface SessionActions {
     fun setControlMode(mode: ControlMode)
     fun toggleKeyboard()
+    /** Phone input method <-> PC-layout keyboard. */
+    fun switchKeyboard()
+    fun pcKeyboardHeight(px: Int)
     fun setGameMode(game: Boolean)
     fun setShowStats(show: Boolean)
     fun setShowGuideOnConnect(show: Boolean)
@@ -160,7 +165,9 @@ fun SessionOverlay(ui: SessionUi, keys: KeyboardController, actions: SessionActi
             ui.transfer?.let { TransferChip(it) }
         }
 
-        if (ui.keyboardOpen) {
+        if (ui.pcKeyboardOpen) {
+            PcKeyboard(keys, actions::switchKeyboard, actions::toggleKeyboard, actions::pcKeyboardHeight, Modifier.align(Alignment.BottomCenter))
+        } else if (ui.keyboardOpen) {
             ExtraKeys(keys, actions, Modifier.align(Alignment.BottomCenter).windowInsetsPadding(WindowInsets.ime))
         }
 
@@ -573,7 +580,9 @@ private fun ExtraKeys(keys: KeyboardController, actions: SessionActions, modifie
                 }
             }
         }
+        TextButton(onClick = actions::switchKeyboard) { Text("电脑键盘", color = AccentCyan) }
         TextButton(onClick = actions::toggleKeyboard) { Text("收起", color = AccentCyan) }
+
     }
 }
 
