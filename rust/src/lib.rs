@@ -534,8 +534,26 @@ pub extern "system" fn Java_app_nya_remote_core_NativeCore_usbUnshare<'l>(mut en
     }
 }
 
-/// Disconnect; a Disconnected event follows.
+/// Stop a running transfer (id as in its events) on both sides.
+#[no_mangle]
+pub extern "system" fn Java_app_nya_remote_core_NativeCore_cancelTransfer<'l>(mut env: JNIEnv<'l>, _cls: JClass<'l>, h: jlong, id: JString<'l>) {
+    let Some(id) = string(&mut env, &id).and_then(|i| i.parse::<u64>().ok()) else { return };
+    if let Some(s) = session(h) {
+        s.cmd(session::NetCmd::CancelTransfer(id));
+    }
+}
 
+/// Connection mode "auto" / "udp" / "tcp"; reconnects when the connection
+/// has to move.
+#[no_mangle]
+pub extern "system" fn Java_app_nya_remote_core_NativeCore_setTransport<'l>(mut env: JNIEnv<'l>, _cls: JClass<'l>, h: jlong, mode: JString<'l>) {
+    let mode = string(&mut env, &mode).unwrap_or_default();
+    if let Some(s) = session(h) {
+        s.cmd(session::NetCmd::SetTransport(net::Transport::parse(&mode)));
+    }
+}
+
+/// Disconnect; a Disconnected event follows.
 #[no_mangle]
 pub extern "system" fn Java_app_nya_remote_core_NativeCore_stop(_env: JNIEnv, _cls: JClass, h: jlong) {
     if let Some(s) = session(h) {

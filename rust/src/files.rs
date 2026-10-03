@@ -1,20 +1,19 @@
 //! File transfer (FEATURE_FILE_TRANSFER): uploads of files the user picked on
 //! the phone, and downloads of files copied on the host (FileOffer ->
-//! FileRequest -> FILE streams). Same wire format as the Windows client
-//! (`nya_transport::files`).
+//! FileRequest -> files). Same wire format as the Windows client
+//! (`nya_transport::files`): every file goes through the connection's
+//! `FileLink`, over the TCP file channel once the host offered one
+//! (FEATURE_TCP_FILES), else as FILE streams on QUIC.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Result};
-use nya_proto::frame::stream_type;
-use nya_proto::framing::encode_varint;
 use nya_proto::pb;
-use nya_transport::files;
-use nya_transport::quinn::{Connection, RecvStream};
-use tokio::io::AsyncReadExt;
+use nya_transport::files::{self, FileLink};
+use nya_transport::quinn::RecvStream;
+use tokio::io::AsyncRead;
 
 use crate::events::{Event, OfferedFile};
 use crate::session::Shared;
@@ -61,7 +60,12 @@ impl<'a> Progress<'a> {
     }
 
     fn add(&mut self, n: u64) {
-        self.done += n;
+        self.set(self.done + n);
+    }
+
+    /// Bytes done so far (of the whole batch).
+    fn set(&mut self, done: u64) {
+        self.done = done;
         if self.last.elapsed() >= Duration::from_millis(200) {
             self.last = Instant::now();
             self.sh.event(self.event(false, true, String::new()));
@@ -77,10 +81,8 @@ impl<'a> Progress<'a> {
     }
 }
 
-const CHUNK: usize = 256 * 1024;
-
 /// Send the picked files as one batch; the host answers with a FileResult.
-pub async fn upload(conn: Connection, items: Vec<Upload>, sh: Arc<Shared>) {
+pub async fn upload(link: FileLink, items: Vec<Upload>, sh: Arc<Shared>) {
     let id = new_id();
     let total = items.iter().map(|u| u.size).sum();
     let mut prog = Progress::new(&sh, id, true, total);
@@ -96,7 +98,10 @@ pub async fn upload(conn: Connection, items: Vec<Upload>, sh: Arc<Shared>) {
             count,
             path: String::new(),
         };
-        if let Err(e) = send_one(&conn, h, u.file, &mut prog).await {
+        // The app already opened it (a content URI has no path): hand that file over.
+        let file = Mutex::new(Some(u.file));
+        let open: files::Opener = Arc::new(move |_| file.lock().unwrap().take().ok_or_else(|| std::io::Error::other("文件已经发送过")));
+        if let Err(e) = link.send_file(h, Path::new(&u.name), Some(&open), |n| prog.add(n)).await {
             prog.finish(Err(format!("发送 {} 失败：{e:#}", u.name)));
             return;
         }
@@ -106,34 +111,11 @@ pub async fn upload(conn: Connection, items: Vec<Upload>, sh: Arc<Shared>) {
     sh.event(prog.event(false, true, "等待电脑确认…".into()));
 }
 
-async fn send_one(conn: &Connection, header: pb::FileHeader, file: std::fs::File, prog: &mut Progress<'_>) -> Result<()> {
-    let mut file = tokio::fs::File::from_std(file);
-    let mut s = conn.open_uni().await?;
-    s.set_priority(-1)?; // below video, input and cursor
-    let mut prelude = Vec::new();
-    encode_varint(stream_type::FILE, &mut prelude);
-    prelude.extend(nya_proto::framing::encode_msg(&header));
-    s.write_all(&prelude).await?;
-    let mut buf = vec![0u8; CHUNK];
-    let mut left = header.size;
-    while left > 0 {
-        let n = file.read(&mut buf[..(left.min(CHUNK as u64) as usize)]).await?;
-        if n == 0 {
-            bail!("文件在发送过程中变小了");
-        }
-        s.write_all(&buf[..n]).await?;
-        left -= n as u64;
-        prog.add(n as u64);
-    }
-    s.finish()?;
-    Ok(())
-}
-
 /// The host pastes files copied on the phone (FEATURE_CLIPBOARD_FILES).
-pub async fn send_clipboard(conn: Connection, id: u64, items: Vec<files::Item>, sh: Arc<Shared>) {
+pub async fn send_clipboard(link: FileLink, id: u64, items: Vec<files::Item>, sh: Arc<Shared>) {
     let total = items.iter().filter(|i| !i.is_dir).map(|i| i.size).sum();
     let mut prog = Progress::new(&sh, id, true, total);
-    let res = nya_transport::clipfiles::send_items(&conn, id, &items, pb::FilePurpose::Clipboard, |name, n| {
+    let res = nya_transport::clipfiles::send_items_with(&link, id, &items, pb::FilePurpose::Clipboard, None, |name, n| {
         if prog.name != name {
             prog.name = name.to_owned();
         }
@@ -142,12 +124,20 @@ pub async fn send_clipboard(conn: Connection, id: u64, items: Vec<files::Item>, 
     .await;
     match res {
         Ok(()) => prog.finish(Ok(format!("已粘贴到电脑（{} 项）", items.len()))),
-        Err(e) => prog.finish(Err(format!("复制到电脑失败：{e:#}"))),
+        Err(e) => {
+            let msg = format!("复制到电脑失败：{e:#}");
+            // The paste on the host waits for these files; a cancel it already knows of.
+            if !link.cancels().is_cancelled(id) {
+                let r = pb::FileResult { transfer_id: id, ok: false, message: msg.clone(), saved_to: String::new() };
+                sh.control(pb::control_msg::Msg::FileResult(r));
+            }
+            prog.finish(Err(msg));
+        }
     }
 }
 
 /// An image copied on the phone, as CF_DIB bytes.
-pub async fn send_image(conn: Connection, dib: Vec<u8>) {
+pub async fn send_image(link: FileLink, dib: Vec<u8>) {
     let h = pb::FileHeader {
         transfer_id: new_id(),
         name: "clipboard.dib".into(),
@@ -157,7 +147,7 @@ pub async fn send_image(conn: Connection, dib: Vec<u8>) {
         count: 1,
         path: String::new(),
     };
-    if let Err(e) = files::send_bytes(&conn, h, &dib).await {
+    if let Err(e) = link.send_bytes(h, &dib).await {
         tracing::debug!("clipboard image: {e:#}");
     }
 }
@@ -167,7 +157,8 @@ pub async fn send_image(conn: Connection, dib: Vec<u8>) {
 pub struct Downloads {
     /// offer id -> total bytes (from the FileOffer).
     offers: Mutex<HashMap<u64, u64>>,
-    /// offer id -> (received files, bytes so far).
+    /// offer id -> (received files, bytes so far of the whole batch). Files
+    /// of a batch may arrive at the same time: one count for all of them.
     batches: Mutex<HashMap<u64, (Vec<PathBuf>, u64)>>,
 }
 
@@ -187,35 +178,51 @@ impl Downloads {
         Event::FileOffer { id: o.transfer_id.to_string(), files, total_bytes }
     }
 
+    /// The batch failed, or is requested again: it starts over.
     pub fn forget(&self, id: u64) {
         self.batches.lock().unwrap().remove(&id);
     }
+
+    /// `n` more bytes of batch `id`; returns the batch's bytes so far.
+    fn add(&self, id: u64, n: u64) -> u64 {
+        let mut b = self.batches.lock().unwrap();
+        let e = b.entry(id).or_default();
+        e.1 += n;
+        e.1
+    }
 }
 
-/// What FILE streams from the host may carry (negotiated features) and where they go.
+/// What files from the host may carry (negotiated features) and where they go.
 #[derive(Clone)]
 pub struct Receive {
     pub dir: Option<PathBuf>,
     pub save: bool,
     pub images: bool,
     pub print: bool,
+    /// Transfers cancelled on either side (the connection's `FileLink`).
+    pub cancels: Arc<files::Cancels>,
 }
 
-/// A FILE stream from the host (after the type varint): a requested download,
-/// an image copied on the host, or a print job.
+/// A FILE stream from the host (after the type varint).
 pub async fn receive(mut r: RecvStream, sh: Arc<Shared>, dl: Arc<Downloads>, rx: Receive) {
     let h = match files::read_header(&mut r).await {
         Ok(h) => h,
         Err(e) => return tracing::warn!("file header: {e:#}"),
     };
+    receive_body(h, &mut r, sh, dl, rx).await
+}
+
+/// A file from the host (QUIC FILE stream or the TCP file channel): a
+/// requested download, an image copied on the host, or a print job.
+/// Returning without reading it refuses it.
+pub async fn receive_body<R: AsyncRead + Unpin>(h: pb::FileHeader, r: &mut R, sh: Arc<Shared>, dl: Arc<Downloads>, rx: Receive) {
+    // Cancelled (here or by the host): reads fail, partial files are removed.
+    let r = &mut files::Cancellable::new(r, rx.cancels.flag(h.transfer_id));
     let purpose = pb::FilePurpose::try_from(h.purpose).unwrap_or(pb::FilePurpose::Unspecified);
-    let Some(dir) = rx.dir.clone() else {
-        let _ = r.stop(0u32.into());
-        return;
-    };
+    let Some(dir) = rx.dir.clone() else { return };
     match purpose {
         pb::FilePurpose::ClipboardImage if rx.images => {
-            match files::receive_to_vec(&mut r, &h, files::MAX_IMAGE_BYTES).await {
+            match files::receive_to_vec(r, &h, files::MAX_IMAGE_BYTES).await {
                 Ok(dib) => {
                     let path = dir.join("clipboard.dib");
                     let write = async {
@@ -232,7 +239,7 @@ pub async fn receive(mut r: RecvStream, sh: Arc<Shared>, dl: Arc<Downloads>, rx:
             return;
         }
         pb::FilePurpose::Print if rx.print => {
-            match files::receive_to_dir(&mut r, &h, &dir.join("print"), |_| {}).await {
+            match files::receive_to_dir(r, &h, &dir.join("print"), |_| {}).await {
                 Ok(p) => {
                     tracing::info!("print job from the host: {}", p.display());
                     sh.event(Event::PrintJob { path: p.to_string_lossy().into_owned() });
@@ -242,28 +249,25 @@ pub async fn receive(mut r: RecvStream, sh: Arc<Shared>, dl: Arc<Downloads>, rx:
             return;
         }
         pb::FilePurpose::Save | pb::FilePurpose::Unspecified if rx.save => {}
-        _ => {
-            let _ = r.stop(0u32.into());
-            return;
-        }
+        _ => return,
     }
     // One folder per batch: the app moves its files away when it is complete.
-    let dir = dir.join(format!("{:016x}", h.transfer_id));
-    let total = dl.offers.lock().unwrap().get(&h.transfer_id).copied().unwrap_or(0);
-    let already = dl.batches.lock().unwrap().get(&h.transfer_id).map(|b| b.1).unwrap_or(0);
-    let mut prog = Progress::new(&sh, h.transfer_id, false, total);
+    let id = h.transfer_id;
+    let dir = dir.join(format!("{id:016x}"));
+    let total = dl.offers.lock().unwrap().get(&id).copied().unwrap_or(0);
+    let mut prog = Progress::new(&sh, id, false, total);
     prog.name = h.name.clone();
-    prog.done = already;
-    let res = files::receive_to_dir(&mut r, &h, &dir, |n| prog.add(n)).await;
+    prog.done = dl.add(id, 0);
+    let res = files::receive_to_dir(r, &h, &dir, |n| prog.set(dl.add(id, n))).await;
     match res {
         Ok(p) => {
+            // Complete once every file is in (they may finish out of order).
             let done = {
                 let mut b = dl.batches.lock().unwrap();
-                let e = b.entry(h.transfer_id).or_default();
+                let e = b.entry(id).or_default();
                 e.0.push(p);
-                e.1 += h.size;
-                if h.index + 1 >= h.count {
-                    b.remove(&h.transfer_id).map(|x| x.0)
+                if e.0.len() as u32 >= h.count {
+                    b.remove(&id).map(|x| x.0)
                 } else {
                     None
                 }
@@ -271,13 +275,13 @@ pub async fn receive(mut r: RecvStream, sh: Arc<Shared>, dl: Arc<Downloads>, rx:
             if let Some(paths) = done {
                 prog.finish(Ok(format!("已接收 {} 个文件", paths.len())));
                 sh.event(Event::FilesReceived {
-                    id: h.transfer_id.to_string(),
+                    id: id.to_string(),
                     paths: paths.iter().map(|p| p.to_string_lossy().into_owned()).collect(),
                 });
             }
         }
         Err(e) => {
-            dl.forget(h.transfer_id);
+            dl.forget(id);
             prog.finish(Err(format!("接收 {} 失败：{e:#}", h.name)));
         }
     }

@@ -232,6 +232,7 @@ fn pairs_streams_and_resyncs_on_gaps() {
             read_only: true,
         }],
         reverify: false,
+        transport: "udp".into(),
     };
     let session = Session::start(&dir, cfg).unwrap();
 
@@ -326,6 +327,7 @@ fn changed_certificate_is_reported_then_verified_by_fingerprint() {
         download_dir: None,
         shares: vec![],
         reverify,
+        transport: String::new(),
     };
 
     // Pinned to another certificate: not a plain failure, the app can re-check.
@@ -350,5 +352,235 @@ fn changed_certificate_is_reported_then_verified_by_fingerprint() {
         }
         drop(s);
     }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// What the TCP-only fake host received over its file channel.
+type Received = tokio::sync::mpsc::UnboundedReceiver<(pb::FileHeader, Result<Vec<u8>, String>)>;
+
+/// A reader that hands out `size` bytes slowly (a download that takes a while).
+fn slow_source(size: usize) -> tokio::io::DuplexStream {
+    use tokio::io::AsyncWriteExt;
+    let (mut w, r) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        let chunk = vec![7u8; 64 * 1024];
+        let mut left = size;
+        while left > 0 {
+            let n = left.min(chunk.len());
+            if w.write_all(&chunk[..n]).await.is_err() {
+                return;
+            }
+            left -= n;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+    r
+}
+
+/// A host reachable over TCP only (the whole session as QUIC over TCP) that
+/// opens a file channel: a download and an upload over it, then a download
+/// the phone cancels and an upload the host cancels.
+async fn tcp_host(addr: std::net::SocketAddr, id: Identity) -> (Vec<(String, Vec<u8>)>, bool) {
+    use nya_transport::filechan;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    let socket = nya_transport::tcptunnel::TunnelSocket::new(addr);
+    let endpoint = nya_transport::tcptunnel::server_endpoint(socket.clone(), &id).unwrap();
+    let expected = Arc::new(filechan::Expected::default());
+    {
+        let (id, expected) = (id.clone(), expected.clone());
+        tokio::spawn(async move { filechan::listen(addr, &id, expected, Some(socket)).await.unwrap() });
+    }
+
+    let conn = endpoint.accept().await.unwrap().await.unwrap();
+    let client_fp = peer_fingerprint(&conn).unwrap();
+    let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+    let hello: pb::Hello = expect_msg(&mut recv, MAX_MESSAGE_LEN).await.unwrap();
+    let neg = negotiate::negotiate(&hello, &LocalVersion::current()).unwrap();
+    assert!(neg.has(pb::Feature::TcpFiles), "the phone takes files over TCP");
+    let welcome = pb::Welcome {
+        proto_major: neg.major,
+        proto_minor: neg.minor,
+        server_name: "tcp host".into(),
+        server_version: "0.0.0".into(),
+        features: neg.features.iter().copied().collect(),
+        needs_pairing: false,
+    };
+    write_msg(&mut send, &pb::HelloReply { reply: Some(pb::hello_reply::Reply::Welcome(welcome)) }).await.unwrap();
+    let _caps: pb::ControlMsg = expect_msg(&mut recv, MAX_MESSAGE_LEN).await.unwrap();
+    let _start: pb::ControlMsg = expect_msg(&mut recv, MAX_MESSAGE_LEN).await.unwrap();
+
+    // The file channel: a token on the control stream, the phone connects over TCP.
+    let place = expected.expect(client_fp);
+    write_msg(&mut send, &ctl(Msg::FileChannel(pb::FileChannel { token: place.token.clone() }))).await.unwrap();
+    let (got_tx, mut got): (_, Received) = tokio::sync::mpsc::unbounded_channel();
+    // An upload named "big.bin" stops after its first byte until told to go on.
+    let (first_chunk_tx, mut first_chunk) = tokio::sync::mpsc::unbounded_channel::<u64>();
+    let go_on = Arc::new(tokio::sync::Notify::new());
+    let on_file: filechan::OnFile = {
+        let go_on = go_on.clone();
+        Arc::new(move |h: pb::FileHeader, mut r: filechan::FileReader| {
+            let (got_tx, first_chunk_tx, go_on) = (got_tx.clone(), first_chunk_tx.clone(), go_on.clone());
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut data = vec![0u8; h.size as usize];
+                let res = async {
+                    if h.name == "big.bin" {
+                        r.read_exact(&mut data[..1]).await?;
+                        let _ = first_chunk_tx.send(h.transfer_id);
+                        go_on.notified().await;
+                        r.read_exact(&mut data[1..]).await?;
+                    } else {
+                        r.read_exact(&mut data).await?;
+                    }
+                    std::io::Result::Ok(())
+                }
+                .await;
+                let _ = got_tx.send((h, res.map(|_| data).map_err(|e| e.to_string())));
+            });
+        })
+    };
+    let ch = place.accept(Duration::from_secs(5), on_file).await.unwrap();
+
+    let offer = |id: u64, name: &str, size: u64| pb::FileOffer {
+        transfer_id: id,
+        files: vec![pb::FileEntry { name: name.into(), size, path: name.into(), is_dir: false }],
+    };
+    write_msg(&mut send, &ctl(Msg::FileOffer(offer(1, "host.txt", 5)))).await.unwrap();
+    write_msg(&mut send, &ctl(Msg::FileOffer(offer(2, "slow.bin", 4 << 20)))).await.unwrap();
+
+    let mut uploads = Vec::new();
+    let download_cancelled = Arc::new(AtomicBool::new(false));
+    let mut slow_download: Option<tokio::task::JoinHandle<anyhow::Result<()>>> = None;
+    loop {
+        tokio::select! {
+            m = read_msg::<pb::ControlMsg, _>(&mut recv, MAX_MESSAGE_LEN) => match m {
+                Ok(Some(m)) => match m.msg {
+                    Some(Msg::Ping(p)) => {
+                        let pong = pb::Pong { t_us: p.t_us, server_t_us: nya_proto::now_us() };
+                        write_msg(&mut send, &ctl(Msg::Pong(pong))).await.unwrap();
+                    }
+                    Some(Msg::FileRequest(r)) => {
+                        let h = |name: &str, size: u64| pb::FileHeader {
+                            transfer_id: r.transfer_id,
+                            name: name.into(),
+                            size,
+                            purpose: pb::FilePurpose::Save as i32,
+                            index: 0,
+                            count: 1,
+                            path: String::new(),
+                        };
+                        if r.transfer_id == 1 {
+                            ch.send_bytes(h("host.txt", 5), b"hello").await.unwrap();
+                        } else {
+                            let (ch, flag, header) = (ch.clone(), download_cancelled.clone(), h("slow.bin", 4 << 20));
+                            slow_download = Some(tokio::spawn(async move {
+                                let cancelled = move || flag.load(Ordering::SeqCst);
+                                ch.send_reader(header, slow_source(4 << 20), |_| {}, &cancelled).await
+                            }));
+                        }
+                    }
+                    Some(Msg::FileCancel(c)) if c.transfer_id == 2 => download_cancelled.store(true, Ordering::SeqCst),
+                    Some(Msg::Bye(_)) => break,
+                    _ => {}
+                },
+                _ => break,
+            },
+            Some(id) = first_chunk.recv() => {
+                // The host stops this upload part way.
+                write_msg(&mut send, &ctl(Msg::FileCancel(pb::FileCancel { transfer_id: id }))).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                go_on.notify_one();
+            }
+            Some((h, data)) = got.recv() => match data {
+                Ok(data) => {
+                    let ok = pb::FileResult { transfer_id: h.transfer_id, ok: true, message: "已保存 1 个文件".into(), saved_to: String::new() };
+                    write_msg(&mut send, &ctl(Msg::FileResult(ok))).await.unwrap();
+                    uploads.push((h.name, data));
+                }
+                Err(e) => uploads.push((h.name, format!("error: {e}").into_bytes())),
+            },
+        }
+    }
+    let download_stopped = match slow_download {
+        Some(t) => t.await.unwrap().is_err_and(|e| e.to_string().contains("已取消")),
+        None => false,
+    };
+    (uploads, download_stopped)
+}
+
+#[test]
+fn session_over_tcp_with_file_channel_and_cancels() {
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+    let host_id = Identity::generate().unwrap();
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let host = rt.spawn(tcp_host(addr, host_id.clone()));
+    std::thread::sleep(Duration::from_millis(100));
+
+    let dir = std::env::temp_dir().join(format!("nya-android-tcp-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let received = dir.join("received");
+    let cfg = StartConfig {
+        address: addr.to_string(),
+        pinned: Some(host_id.fingerprint().to_hex()),
+        pair_code: None,
+        client_name: "test phone".into(),
+        client_version: "0.0.0".into(),
+        decoders: vec![],
+        max_fps: 60,
+        stream: StreamOptions::default(),
+        download_dir: Some(received.to_string_lossy().into_owned()),
+        shares: vec![],
+        reverify: false,
+        transport: "tcp".into(),
+    };
+    let session = Session::start(&dir, cfg).unwrap();
+    let Event::Connected { tcp, .. } = wait_event(&session, |e| matches!(e, Event::Connected { .. })) else { unreachable!() };
+    assert!(tcp, "the session is QUIC over TCP");
+
+    // A download over the file channel.
+    wait_event(&session, |e| matches!(e, Event::FileOffer { id, .. } if id == "1"));
+    session.control(Msg::FileRequest(pb::FileRequest { transfer_id: 1, purpose: pb::FilePurpose::Save as i32 }));
+    let Event::FilesReceived { paths, .. } = wait_event(&session, |e| matches!(e, Event::FilesReceived { .. })) else { unreachable!() };
+    assert_eq!(std::fs::read(&paths[0]).unwrap(), b"hello");
+
+    // An upload over it.
+    let src = dir.join("phone.txt");
+    std::fs::write(&src, b"from the phone").unwrap();
+    let file = std::fs::File::open(&src).unwrap();
+    session.send_files(vec![nya_android::files::Upload { file, name: "phone.txt".into(), size: 14 }]);
+    let Event::Transfer { ok, message, .. } = wait_event(&session, |e| matches!(e, Event::Transfer { finished: true, upload: true, .. })) else { unreachable!() };
+    assert!(ok, "{message}");
+
+    // A slow download the phone cancels: the host stops, the partial file is gone.
+    session.control(Msg::FileRequest(pb::FileRequest { transfer_id: 2, purpose: pb::FilePurpose::Save as i32 }));
+    wait_event(&session, |e| matches!(e, Event::Transfer { id, upload: false, finished: false, .. } if id == "2"));
+    session.cmd(nya_android::session::NetCmd::CancelTransfer(2));
+    let Event::Transfer { ok, message, .. } = wait_event(&session, |e| matches!(e, Event::Transfer { id, finished: true, .. } if id == "2")) else { unreachable!() };
+    assert!(!ok && message.contains("已取消"), "{message}");
+
+    // A big upload the host cancels after its first bytes.
+    let big = dir.join("big.bin");
+    std::fs::write(&big, vec![1u8; 16 << 20]).unwrap();
+    let file = std::fs::File::open(&big).unwrap();
+    session.send_files(vec![nya_android::files::Upload { file, name: "big.bin".into(), size: 16 << 20 }]);
+    wait_event(&session, |e| matches!(e, Event::TransferCancelled { .. }));
+    let Event::Transfer { ok, message, .. } = wait_event(&session, |e| matches!(e, Event::Transfer { finished: true, upload: true, .. })) else { unreachable!() };
+    assert!(!ok && message.contains("已取消"), "{message}");
+
+    // Let the host see the aborted upload before saying goodbye.
+    std::thread::sleep(Duration::from_millis(500));
+    session.stop();
+    wait_event(&session, |e| matches!(e, Event::Disconnected { .. }));
+    let (uploads, download_stopped) = rt.block_on(host).unwrap();
+    assert!(download_stopped, "the host stopped sending the cancelled download");
+    assert_eq!(uploads[0], ("phone.txt".to_string(), b"from the phone".to_vec()));
+    let (name, err) = &uploads[1];
+    assert_eq!(name, "big.bin");
+    assert!(String::from_utf8_lossy(err).contains("已取消"), "the host's reader fails: {}", String::from_utf8_lossy(err));
+    let partial: Vec<_> = std::fs::read_dir(received.join(format!("{:016x}", 2))).map(|d| d.flatten().map(|e| e.path()).collect()).unwrap_or_default();
+    assert!(partial.is_empty(), "no partial download left: {partial:?}");
+    drop(session);
     let _ = std::fs::remove_dir_all(dir);
 }

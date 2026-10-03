@@ -56,6 +56,7 @@ import app.nya.remote.input.ScanKey
 import app.nya.remote.input.TouchAction
 import app.nya.remote.input.Viewport
 import app.nya.remote.ui.NyaTheme
+import app.nya.remote.ui.connectionModes
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
@@ -295,6 +296,7 @@ class SessionActivity : ComponentActivity(), SessionActions {
             downloadDir = Downloads.receiveDir(this).absolutePath,
             shares = if (Shares.accessGranted()) s.sharedFolders else emptyList(),
             reverify = reverify,
+            transport = s.transport,
         )
         ui.status = Status.Connecting
         ui.pinChanged = null
@@ -369,6 +371,7 @@ class SessionActivity : ComponentActivity(), SessionActions {
                 ui.offers += e
             }
             is CoreEvent.Transfer -> onTransfer(e)
+            is CoreEvent.TransferCancelled -> markCancelled(e.id, e.message)
             is CoreEvent.FilesReceived -> saveReceived(e)
             is CoreEvent.Rumble -> gamepads.rumble(e.index, e.large, e.small) { InputDevice.getDevice(it) }
         }
@@ -380,6 +383,7 @@ class SessionActivity : ComponentActivity(), SessionActions {
         ui.verifyFingerprint = null
         reverify = false
         ui.fileTransfer = e.fileTransfer
+        ui.viaTcp = e.tcp
         ui.gamepad = e.gamepad
         ui.usb = e.usb
         ui.micFeature = e.microphone
@@ -430,6 +434,8 @@ class SessionActivity : ComponentActivity(), SessionActions {
 
     private fun onTransfer(e: CoreEvent.Transfer) {
         val i = ui.transfers.indexOfFirst { it.t.id == e.id && it.t.upload == e.upload }
+        // Cancelled: what the stopping tasks (and the host) report changes nothing.
+        if (i >= 0 && ui.transfers[i].cancelled) return
         if (i >= 0) ui.transfers[i] = ui.transfers[i].copy(t = e) else ui.transfers += TransferItem(e)
         while (ui.transfers.size > 8) {
             val old = ui.transfers.indexOfFirst { it.t.finished }
@@ -439,6 +445,16 @@ class SessionActivity : ComponentActivity(), SessionActions {
         // Finished uploads go away on their own after a while; downloads stay until saved.
         if (e.finished && e.upload && e.ok) {
             main.postDelayed({ ui.transfers.removeAll { it.t.id == e.id && it.t.upload && it.t.finished } }, 8000)
+        }
+    }
+
+    /** Transfer [id] was stopped (here or by the host): its running rows say so. */
+    private fun markCancelled(id: String, message: String) {
+        for (i in ui.transfers.indices) {
+            val item = ui.transfers[i]
+            if (item.t.id == id && !item.t.finished) {
+                ui.transfers[i] = item.copy(t = item.t.copy(finished = true, ok = false, message = message), cancelled = true)
+            }
         }
     }
 
@@ -562,6 +578,7 @@ class SessionActivity : ComponentActivity(), SessionActions {
         audio = null
         ui.offers.clear()
         ui.transfers.clear()
+        ui.viaTcp = null
         ui.notice = ""
         val s = session ?: return
         session = null
@@ -841,6 +858,18 @@ class SessionActivity : ComponentActivity(), SessionActions {
         ui.notice = "正在切换码率策略…"
     }
 
+    override fun setTransport(mode: String) {
+        if (sd.transport == mode) return
+        remember { it.copy(transport = mode) }
+        session?.setTransport(mode)
+        // Only a move between UDP and TCP reconnects; the status card shows it.
+        val moves = (mode == "tcp" && ui.viaTcp == false) || (mode == "udp" && ui.viaTcp == true)
+        if (!moves) {
+            ui.notice = "连接方式：${connectionModes.find { it.first == mode }?.second ?: mode}"
+            main.postDelayed({ ui.notice = "" }, 2500)
+        }
+    }
+
     override fun setShowStats(show: Boolean) {
         ui.showStats = show
         config = configStore.update { it.copy(showStats = show) }
@@ -974,6 +1003,11 @@ class SessionActivity : ComponentActivity(), SessionActions {
 
     override fun dismissTransfer(id: String) {
         ui.transfers.removeAll { it.t.id == id && it.t.finished }
+    }
+
+    override fun cancelTransfer(id: String) {
+        markCancelled(id, "已取消")
+        session?.cancelTransfer(id)
     }
 
     override fun openDownloads() {

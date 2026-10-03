@@ -70,6 +70,8 @@ class RemoteSession(dataDir: String, config: StartConfig, private val onEvent: (
         onHandle { NativeCore.audioPull(it, maxFrames, deviceQueued, out) } ?: 0
     fun requestFiles(offerId: String) = onHandle { NativeCore.requestFiles(it, offerId) }
     fun sendFiles(json: String) = onHandle { NativeCore.sendFiles(it, json) }
+    fun cancelTransfer(id: String) = onHandle { NativeCore.cancelTransfer(it, id) }
+    fun setTransport(mode: String) = onHandle { NativeCore.setTransport(it, mode) }
     fun mic(opus: ByteArray) = onHandle { NativeCore.mic(it, opus) }
     fun clipboardImage(dib: ByteArray) = onHandle { NativeCore.clipboardImage(it, dib) }
     fun clipboardFiles(pathsJson: String) = onHandle { NativeCore.clipboardFiles(it, pathsJson) }

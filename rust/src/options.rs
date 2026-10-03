@@ -34,6 +34,10 @@ pub struct StartConfig {
     /// fingerprint is shown for confirmation first (`verifyFingerprint`).
     #[serde(default)]
     pub reverify: bool,
+    /// Connection mode: "auto" (UDP; TCP when UDP does not connect or loses
+    /// too much) | "udp" | "tcp" (QUIC over TCP).
+    #[serde(default)]
+    pub transport: String,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]

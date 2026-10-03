@@ -123,5 +123,15 @@ class InputFeaturesTest {
         ) as CoreEvent.Connected
         assertEquals(true, c.textInput)
         assertEquals(false, c.gamepad)
+        assertEquals(false, c.tcp)
+        val tcp = CoreEvent.parse(
+            """{"type":"connected","serverName":"pc","serverVersion":"0.9","serverFingerprint":"ab","serverFingerprintShort":"AB","textInput":true,"fileTransfer":true,"gamepad":false,"tcp":true}""",
+        ) as CoreEvent.Connected
+        assertEquals(true, tcp.tcp)
+        val x = CoreEvent.parse("""{"type":"transferCancelled","id":"7","message":"被控端取消了传输"}""")
+        assertEquals(CoreEvent.TransferCancelled("7", "被控端取消了传输"), x)
+        val s = CoreEvent.parse("""{"type":"stats","fps":60,"pathLossPct":12.5,"pathRttMs":40}""") as CoreEvent.Stats
+        assertEquals(12.5f, s.line.pathLossPct)
+        assertEquals(40f, s.line.pathRttMs)
     }
 }

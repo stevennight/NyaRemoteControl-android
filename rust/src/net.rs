@@ -1,8 +1,10 @@
 //! Connection, handshake, pairing and the long-running session with automatic
 //! reconnection. A trimmed port of the Windows client's net.rs: video, audio,
 //! cursor, input (keys, text, gamepads), clipboard (text, images, files),
-//! file transfer, printing, microphone, folder mount, USB tunnels and stream
-//! control. Not offered: 4:4:4 (phone decoders are 4:2:0).
+//! file transfer (over the TCP file channel when the host offers one,
+//! cancellable), printing, microphone, folder mount, USB tunnels, stream
+//! control and the connection mode (QUIC over UDP or over TCP). Not offered:
+//! 4:4:4 (phone decoders are 4:2:0).
 
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
@@ -15,6 +17,7 @@ use nya_proto::framing::{encode_varint, expect_msg, read_msg, read_varint, write
 use nya_proto::negotiate::{self, LocalVersion, Negotiated};
 use nya_proto::pb::{self, control_msg::Msg, Feature};
 use nya_proto::{MAX_MESSAGE_LEN, MAX_VIDEO_FRAME_LEN};
+use nya_transport::files::FileLink;
 use nya_transport::identity::peer_fingerprint;
 use nya_transport::pairing::{self, PairingKey, Transcript};
 use nya_transport::quinn::{Connection, Endpoint, RecvStream, SendStream};
@@ -53,6 +56,7 @@ pub fn local_version() -> LocalVersion {
         Feature::Print,
         Feature::Hdr,
         Feature::UsbRedirect,
+        Feature::TcpFiles,
     ]
     .into_iter()
     .map(|f| f as u32)
@@ -70,9 +74,97 @@ pub struct Link {
     pub neg: Negotiated,
     pub welcome: pb::Welcome,
     pub server_fp: Fingerprint,
+    /// QUIC over TCP (else UDP).
+    pub via_tcp: bool,
+}
+
+/// How a session travels (setting `transport`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    /// UDP; TCP when UDP does not connect or loses too much, back to UDP
+    /// when it works again (see [`supervise`]).
+    Auto,
+    Udp,
+    /// QUIC over TCP (nya_transport::tcptunnel).
+    Tcp,
+}
+
+impl Transport {
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "udp" => Self::Udp,
+            "tcp" => Self::Tcp,
+            _ => Self::Auto,
+        }
+    }
+}
+
+/// Auto: how long the preferred transport may try alone before the other one starts too.
+pub const HEAD_START: Duration = Duration::from_millis(2500);
+/// Auto: host-reported loss on UDP that counts as bad, and for how long it
+/// has to last before the session moves to TCP.
+const BAD_LOSS_PCT: f32 = 10.0;
+const BAD_FOR: Duration = Duration::from_secs(20);
+/// Auto, on TCP: how often UDP is tried again.
+const UDP_PROBE_EVERY: Duration = Duration::from_secs(300);
+/// Auto: after moving to TCP for loss, stay this long (doubling each time, up to an hour).
+const FIRST_TCP_HOLD: Duration = Duration::from_secs(600);
+
+type Opened = (Endpoint, Connection, bool);
+
+async fn open_one(addr: SocketAddr, id: Identity, pinned: Option<Fingerprint>, tcp: bool) -> Result<Opened> {
+    let endpoint = if tcp {
+        nya_transport::tcptunnel::client_endpoint(addr).await?
+    } else {
+        nya_transport::endpoint::client_endpoint(addr)?
+    };
+    let conn = timeout(Duration::from_secs(8), nya_transport::endpoint::connect(&endpoint, addr, &id, pinned))
+        .await
+        .map_err(|_| anyhow!("{} 连接超时", if tcp { "TCP" } else { "UDP" }))??;
+    Ok((endpoint, conn, tcp))
+}
+
+/// The QUIC connection: over UDP, over TCP, or (auto) the preferred one with
+/// a head start and then both at once — the first that connects is used.
+pub async fn open(addr: SocketAddr, id: &Identity, pinned: Option<Fingerprint>, mode: Transport, prefer_tcp: bool) -> Result<Opened> {
+    let first_tcp = match mode {
+        Transport::Udp => return open_one(addr, id.clone(), pinned, false).await,
+        Transport::Tcp => return open_one(addr, id.clone(), pinned, true).await,
+        Transport::Auto => prefer_tcp,
+    };
+    let a = open_one(addr, id.clone(), pinned, first_tcp);
+    tokio::pin!(a);
+    let mut err_a = None;
+    tokio::select! {
+        r = &mut a => match r {
+            Ok(x) => return Ok(x),
+            Err(e) => err_a = Some(e),
+        },
+        _ = tokio::time::sleep(HEAD_START) => {}
+    }
+    let b = open_one(addr, id.clone(), pinned, !first_tcp);
+    tokio::pin!(b);
+    let mut err_b = None;
+    loop {
+        tokio::select! {
+            r = &mut a, if err_a.is_none() => match r {
+                Ok(x) => return Ok(x),
+                Err(e) => err_a = Some(e),
+            },
+            r = &mut b, if err_b.is_none() => match r {
+                Ok(x) => return Ok(x),
+                Err(e) => err_b = Some(e),
+            },
+        }
+        if let (Some(ea), Some(eb)) = (&err_a, &err_b) {
+            let (udp, tcp) = if first_tcp { (eb, ea) } else { (ea, eb) };
+            bail!("UDP：{udp:#}；TCP：{tcp:#}（检查组网是否连通、被控端是否运行、防火墙和端口转发的 UDP / TCP 端口）");
+        }
+    }
 }
 
 /// Connect and complete the handshake (and pairing if the host asks for it).
+#[allow(clippy::too_many_arguments)]
 pub async fn connect(
     addr: SocketAddr,
     id: &Identity,
@@ -80,11 +172,11 @@ pub async fn connect(
     client_name: &str,
     client_version: &str,
     prompt: Option<PairPrompt>,
+    mode: Transport,
+    prefer_tcp: bool,
 ) -> Result<Link> {
-    let endpoint = nya_transport::endpoint::client_endpoint(addr)?;
-    let conn = timeout(Duration::from_secs(8), nya_transport::endpoint::connect(&endpoint, addr, id, pinned))
-        .await
-        .map_err(|_| anyhow!("连接 {addr} 超时（检查组网是否连通、被控端是否运行、防火墙 UDP 端口）"))??;
+    let (endpoint, conn, via_tcp) = open(addr, id, pinned, mode, prefer_tcp).await.with_context(|| format!("连接 {addr} 失败"))?;
+    tracing::info!("connected to {addr} over {}", if via_tcp { "TCP" } else { "UDP" });
     let server_fp = peer_fingerprint(&conn).ok_or_else(|| anyhow!("被控端没有证书"))?;
     let (mut send, mut recv) = conn.open_bi().await?;
 
@@ -123,7 +215,7 @@ pub async fn connect(
     } else if pinned.is_none() {
         tracing::warn!("host already knows this client but we have no pin; trusting {server_fp}");
     }
-    Ok(Link { endpoint, conn, send, recv, neg, welcome, server_fp })
+    Ok(Link { endpoint, conn, send, recv, neg, welcome, server_fp, via_tcp })
 }
 
 /// What a reconnect replays.
@@ -136,14 +228,20 @@ struct Params {
     caps: pb::ClientCaps,
     start: pb::StartStream,
     download_dir: Option<std::path::PathBuf>,
+    /// Connection mode (setting `transport`).
+    transport: Transport,
+    /// Auto: try TCP first until then (moved to TCP for loss).
+    prefer_tcp_until: Option<Instant>,
+    /// Auto: how long the next move to TCP for loss lasts.
+    tcp_hold: Duration,
 }
-
-
 
 enum End {
     UserQuit,
     Fatal(String),
     Lost(String),
+    /// Reconnect over TCP (`true`) or UDP, for this reason.
+    Switch(bool, String),
 }
 
 /// The whole life of a session: resolve, connect (pairing), run, reconnect.
@@ -162,8 +260,9 @@ pub async fn main(cfg: StartConfig, identity: Identity, sh: Arc<Shared>, mut cmd
         let sh = sh.clone();
         Arc::new(move || typed.lock().unwrap().take().or_else(|| sh.ask_pair_code()))
     };
+    let transport = Transport::parse(&cfg.transport);
     let first = tokio::select! {
-        r = connect(addr, &identity, pinned, &cfg.client_name, &cfg.client_version, Some(prompt)) => r,
+        r = connect(addr, &identity, pinned, &cfg.client_name, &cfg.client_version, Some(prompt), transport, false) => r,
         _ = wait_quit(&mut cmds) => return sh.event(Event::Disconnected { message: "已取消".into() }),
     };
     let link = match first {
@@ -198,6 +297,9 @@ pub async fn main(cfg: StartConfig, identity: Identity, sh: Arc<Shared>, mut cmd
         caps: cfg.caps(),
         start: cfg.stream.to_start(),
         download_dir: cfg.download_dir.as_ref().map(std::path::PathBuf::from),
+        transport,
+        prefer_tcp_until: None,
+        tcp_hold: FIRST_TCP_HOLD,
     };
     supervise(link, p, cmds, &sh).await;
 }
@@ -215,10 +317,23 @@ async fn wait_quit(cmds: &mut mpsc::UnboundedReceiver<NetCmd>) {
 async fn supervise(first: Link, mut p: Params, mut cmds: mpsc::UnboundedReceiver<NetCmd>, sh: &Arc<Shared>) {
     let mut link = Some(first);
     let mut lost_since: Option<Instant> = None;
+    // The next connection's transport when switching (else the setting).
+    let mut next: Option<Transport> = None;
     loop {
         let l = match link.take() {
             Some(l) => l,
-            None => match connect(p.addr, &p.identity, Some(p.pinned), &p.name, &p.version, None).await {
+            None => match connect(
+                p.addr,
+                &p.identity,
+                Some(p.pinned),
+                &p.name,
+                &p.version,
+                None,
+                next.take().unwrap_or(p.transport),
+                p.prefer_tcp_until.is_some_and(|t| Instant::now() < t),
+            )
+            .await
+            {
                 Ok(l) => l,
                 Err(e) => {
                     let since = *lost_since.get_or_insert_with(Instant::now);
@@ -235,6 +350,7 @@ async fn supervise(first: Link, mut p: Params, mut cmds: mpsc::UnboundedReceiver
                             c = cmds.recv() => match c {
                                 Some(NetCmd::Quit) | None => return sh.event(Event::Disconnected { message: "已断开".into() }),
                                 Some(NetCmd::Control(m)) => track(&mut p, &m),
+                                Some(NetCmd::SetTransport(t)) => p.transport = t,
                                 _ => {}
                             }
                         }
@@ -261,6 +377,7 @@ async fn supervise(first: Link, mut p: Params, mut cmds: mpsc::UnboundedReceiver
             usb: l.neg.has(Feature::UsbRedirect),
             hdr: l.neg.has(Feature::Hdr),
             virtual_display: l.neg.has(Feature::VirtualDisplay),
+            tcp: l.via_tcp,
         });
         match run(l, &mut p, &mut cmds, sh).await {
             End::UserQuit => return sh.event(Event::Disconnected { message: "已断开".into() }),
@@ -268,6 +385,17 @@ async fn supervise(first: Link, mut p: Params, mut cmds: mpsc::UnboundedReceiver
             End::Lost(msg) => {
                 tracing::warn!("connection lost: {msg}");
                 sh.event(Event::Reconnecting { message: msg });
+            }
+            End::Switch(tcp, why) => {
+                tracing::info!("switching to {}: {why}", if tcp { "TCP" } else { "UDP" });
+                if tcp && p.transport == Transport::Auto {
+                    p.prefer_tcp_until = Some(Instant::now() + p.tcp_hold);
+                    p.tcp_hold = (p.tcp_hold * 2).min(Duration::from_secs(3600));
+                } else if !tcp {
+                    p.prefer_tcp_until = None;
+                }
+                next = Some(if tcp { Transport::Tcp } else { Transport::Udp });
+                sh.event(Event::Reconnecting { message: format!("{why}，正在改用 {}", if tcp { "TCP" } else { "UDP" }) });
             }
         }
     }
@@ -283,8 +411,20 @@ fn track(p: &mut Params, m: &pb::ControlMsg) {
     }
 }
 
+/// Stop transfer `id` here: sending stops at the next chunk, receiving fails
+/// (partial files removed), what arrived of a download is forgotten.
+fn cancel_transfer(link: &FileLink, downloads: &crate::files::Downloads, id: u64) {
+    link.cancels().cancel(id);
+    downloads.forget(id);
+}
+
 async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetCmd>, sh: &Arc<Shared>) -> End {
-    let Link { endpoint: _endpoint, conn, mut send, mut recv, neg, .. } = link;
+    let Link { endpoint: _endpoint, conn, mut send, mut recv, neg, via_tcp, .. } = link;
+    // Auto: since when the host has reported bad loss on UDP.
+    let mut bad_since: Option<Instant> = None;
+    // Auto, on TCP: try UDP again now and then.
+    let mut udp_probe = tokio::time::interval_at(tokio::time::Instant::now() + UDP_PROBE_EVERY, UDP_PROBE_EVERY);
+    let mut probe: Option<tokio::task::JoinHandle<bool>> = None;
 
     let setup = async {
         write_msg(&mut send, &ctl(Msg::ClientCaps(p.caps.clone()))).await?;
@@ -311,13 +451,18 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
     let mic_on = neg.has(Feature::Microphone);
     let mount_on = neg.has(Feature::FolderMount);
     let downloads = Arc::new(crate::files::Downloads::default());
+    // Where files go: the TCP file channel once the host offered it and it
+    // is up (FEATURE_TCP_FILES), FILE streams on this connection until then.
+    let files_link = FileLink::new(conn.clone());
     let receive = crate::files::Receive {
         dir: p.download_dir.clone(),
         save: files_on,
         images: images_on,
         print: neg.has(Feature::Print),
+        cancels: files_link.cancels().clone(),
     };
-    let uni = tokio::spawn(accept_uni(conn.clone(), sh.clone(), neg.has(Feature::MultiStream), downloads.clone(), receive));
+    let mut file_channel_task: Option<tokio::task::JoinHandle<()>> = None;
+    let uni = tokio::spawn(accept_uni(conn.clone(), sh.clone(), neg.has(Feature::MultiStream), downloads.clone(), receive.clone()));
     // Bidi streams the host opens: folder requests (FS) and USB tunnels.
     let bidi = tokio::spawn({
         let (conn, sh) = (conn.clone(), sh.clone());
@@ -369,7 +514,19 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
                         sh.event(Event::stream_started(&s));
                     }
                     Some(Msg::StreamError(e)) if e.slot == 0 => sh.event(Event::StreamError { message: e.message }),
-                    Some(Msg::ServerStats(s)) => sh.stats.on_server(s),
+                    Some(Msg::ServerStats(s)) => {
+                        if p.transport == Transport::Auto && !via_tcp && s.slot == 0 {
+                            if s.path_loss_pct >= BAD_LOSS_PCT {
+                                let since = *bad_since.get_or_insert_with(Instant::now);
+                                if since.elapsed() >= BAD_FOR {
+                                    break End::Switch(true, format!("UDP 丢包严重（{:.0}%）", s.path_loss_pct));
+                                }
+                            } else {
+                                bad_since = None;
+                            }
+                        }
+                        sh.stats.on_server(s);
+                    }
                     Some(Msg::ClipboardText(c)) if clipboard => sh.event(Event::Clipboard { text: c.text }),
                     Some(Msg::Pong(p)) => sh.stats.on_pong(p.t_us, p.server_t_us),
                     Some(Msg::FileOffer(o)) if files_on => {
@@ -392,6 +549,33 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
                             message,
                         });
                     }
+                    Some(Msg::FileCancel(c)) => {
+                        tracing::info!("the host cancelled transfer {:016x}", c.transfer_id);
+                        cancel_transfer(&files_link, &downloads, c.transfer_id);
+                        sh.event(Event::TransferCancelled { id: c.transfer_id.to_string(), message: "被控端取消了传输".into() });
+                    }
+                    Some(Msg::FileChannel(fc)) if neg.has(Feature::TcpFiles) => {
+                        // Same address and port as QUIC (a port forward needs both).
+                        let addr = conn.remote_address();
+                        let (identity, pinned, link) = (p.identity.clone(), p.pinned, files_link.clone());
+                        let (sh, downloads, receive) = (sh.clone(), downloads.clone(), receive.clone());
+                        if let Some(t) = file_channel_task.take() {
+                            t.abort();
+                        }
+                        file_channel_task = Some(tokio::spawn(async move {
+                            let on_file: nya_transport::filechan::OnFile = Arc::new(move |h, mut r| {
+                                let (sh, downloads, receive) = (sh.clone(), downloads.clone(), receive.clone());
+                                tokio::spawn(async move { crate::files::receive_body(h, &mut r, sh, downloads, receive).await });
+                            });
+                            match nya_transport::filechan::connect(addr, &identity, pinned, &fc.token, on_file).await {
+                                Ok(ch) => {
+                                    tracing::info!("files go over the TCP file channel ({addr})");
+                                    link.set_tcp(Some(ch));
+                                }
+                                Err(e) => tracing::warn!("file channel (TCP {addr}): {e:#}; files go over QUIC"),
+                            }
+                        }));
+                    }
                     Some(Msg::GamepadRumble(r)) => sh.event(Event::Rumble { index: r.index, large: r.large_motor, small: r.small_motor }),
                     Some(Msg::FileRequest(req)) if clip_files_on => {
                         // The host pastes files copied on the phone.
@@ -399,7 +583,7 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
                         match items {
                             Some(items) => {
                                 tracing::info!("host pastes our files (offer {:016x})", req.transfer_id);
-                                tokio::spawn(crate::files::send_clipboard(conn.clone(), req.transfer_id, items, sh.clone()));
+                                tokio::spawn(crate::files::send_clipboard(files_link.clone(), req.transfer_id, items, sh.clone()));
                             }
                             None => {
                                 let r = pb::FileResult { transfer_id: req.transfer_id, ok: false, message: "这批文件已过期，请在手机上重新复制".into(), saved_to: String::new() };
@@ -428,13 +612,17 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
                     if matches!(m.msg, Some(Msg::ClipboardText(_))) && !clipboard {
                         continue;
                     }
+                    // Requested (again): the batch's progress starts over.
+                    if let Some(Msg::FileRequest(r)) = &m.msg {
+                        downloads.forget(r.transfer_id);
+                    }
                     if let Err(e) = write_msg(&mut send, &m).await {
                         break End::Lost(format!("control: {e}"));
                     }
                 }
                 Some(NetCmd::SendFiles(items)) => {
                     if files_on {
-                        tokio::spawn(crate::files::upload(conn.clone(), items, sh.clone()));
+                        tokio::spawn(crate::files::upload(files_link.clone(), items, sh.clone()));
                     } else {
                         sh.event(Event::Transfer {
                             id: String::new(), upload: true, name: String::new(), done: 0, total: 0,
@@ -449,7 +637,7 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
                 }
                 Some(NetCmd::SendImage(dib)) => {
                     if images_on {
-                        tokio::spawn(crate::files::send_image(conn.clone(), dib));
+                        tokio::spawn(crate::files::send_image(files_link.clone(), dib));
                     }
                 }
                 Some(NetCmd::OfferFiles(paths)) => {
@@ -465,6 +653,21 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
                             id: String::new(), upload: true, name: String::new(), done: 0, total: 0, finished: true, ok: false,
                             message: if clip_files_on { "没有可复制的文件".into() } else { "电脑上的被控端版本不支持复制文件".into() },
                         }),
+                    }
+                }
+                Some(NetCmd::CancelTransfer(id)) => {
+                    tracing::info!("transfer {id:016x} cancelled here");
+                    cancel_transfer(&files_link, &downloads, id);
+                    if let Err(e) = write_msg(&mut send, &ctl(Msg::FileCancel(pb::FileCancel { transfer_id: id }))).await {
+                        break End::Lost(format!("control: {e}"));
+                    }
+                }
+                Some(NetCmd::SetTransport(t)) => {
+                    p.transport = t;
+                    match t {
+                        Transport::Tcp if !via_tcp => break End::Switch(true, "已选择 TCP".into()),
+                        Transport::Udp if via_tcp => break End::Switch(false, "已选择 UDP".into()),
+                        _ => {}
                     }
                 }
                 Some(NetCmd::SetShares(s)) => {
@@ -483,6 +686,29 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
                     break End::UserQuit;
                 }
             },
+            _ = udp_probe.tick(), if p.transport == Transport::Auto && via_tcp && probe.is_none()
+                && p.prefer_tcp_until.is_none_or(|t| Instant::now() >= t) => {
+                let (addr, id, pinned) = (p.addr, p.identity.clone(), p.pinned);
+                probe = Some(tokio::spawn(async move {
+                    match open_one(addr, id, Some(pinned), false).await {
+                        Ok((ep, conn, _)) => {
+                            conn.close(0u32.into(), b"probe");
+                            ep.wait_idle().await;
+                            true
+                        }
+                        Err(e) => {
+                            tracing::info!("UDP still not usable: {e:#}");
+                            false
+                        }
+                    }
+                }));
+            }
+            Some(udp_ok) = async { match probe.as_mut() { Some(h) => h.await.ok(), None => std::future::pending().await } } => {
+                probe = None;
+                if udp_ok {
+                    break End::Switch(false, "UDP 已恢复".into());
+                }
+            }
             _ = ping.tick() => {
                 let _ = write_msg(&mut send, &ctl(Msg::Ping(pb::Ping { t_us: nya_proto::now_us() }))).await;
             }
@@ -499,6 +725,15 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
     uni.abort();
     bidi.abort();
     dgram.abort();
+    if let Some(t) = probe {
+        t.abort();
+    }
+    if let Some(t) = file_channel_task {
+        t.abort();
+    }
+    if let Some(ch) = files_link.tcp() {
+        ch.close().await;
+    }
     end
 }
 
@@ -598,9 +833,58 @@ mod tests {
         assert!(v.has(Feature::VirtualDisplay) && v.has(Feature::VideoDatagram) && v.has(Feature::Audio));
         assert!(v.has(Feature::TextInput) && v.has(Feature::FileTransfer) && v.has(Feature::Gamepad));
         assert!(v.has(Feature::FolderMount) && v.has(Feature::Print) && v.has(Feature::Microphone) && v.has(Feature::UsbRedirect));
+        assert!(v.has(Feature::TcpFiles));
         for f in [Feature::Yuv444] {
             assert!(!v.has(f), "{f:?} must not be offered");
         }
         assert_eq!(v.major, nya_proto::PROTO_MAJOR);
+    }
+
+    #[test]
+    fn transport_setting() {
+        assert_eq!(Transport::parse("tcp"), Transport::Tcp);
+        assert_eq!(Transport::parse("udp"), Transport::Udp);
+        assert_eq!(Transport::parse("auto"), Transport::Auto);
+        assert_eq!(Transport::parse(""), Transport::Auto, "absent = auto");
+    }
+
+    /// A host reachable over TCP only (UDP blocked): auto connects over TCP
+    /// after UDP's head start; UDP only does not connect.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn auto_falls_back_to_tcp() {
+        use tokio::io::AsyncReadExt;
+        let (host_id, client_id) = (Identity::generate().unwrap(), Identity::generate().unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let socket = nya_transport::tcptunnel::TunnelSocket::new(addr);
+        let server = nya_transport::tcptunnel::server_endpoint(socket.clone(), &host_id).unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut tcp, peer)) = listener.accept().await {
+                let mut pre = [0u8; 8];
+                if tcp.read_exact(&mut pre).await.is_ok() {
+                    socket.add(tcp, peer);
+                }
+            }
+        });
+        tokio::spawn(async move {
+            while let Some(i) = server.accept().await {
+                tokio::spawn(async move {
+                    if let Ok(c) = i.await {
+                        c.closed().await;
+                    }
+                });
+            }
+        });
+        let pin = Some(host_id.fingerprint());
+        let start = Instant::now();
+        let (_ep, conn, tcp) = open(addr, &client_id, pin, Transport::Auto, false).await.unwrap();
+        assert!(tcp, "over TCP");
+        assert!(start.elapsed() >= HEAD_START, "UDP had its head start");
+        conn.close(0u32.into(), b"");
+        // Preferring TCP (moved there for loss): connects at once.
+        let start = Instant::now();
+        let (_ep, _conn, tcp) = open(addr, &client_id, pin, Transport::Auto, true).await.unwrap();
+        assert!(tcp && start.elapsed() < HEAD_START);
+        assert!(open(addr, &client_id, pin, Transport::Udp, false).await.is_err(), "no UDP there");
     }
 }

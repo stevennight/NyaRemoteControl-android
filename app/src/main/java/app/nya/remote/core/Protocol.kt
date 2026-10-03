@@ -63,6 +63,8 @@ data class StartConfig(
     val shares: List<ShareConfig> = emptyList(),
     /** Connect without the saved pin; the fingerprint is confirmed by the user. */
     val reverify: Boolean = false,
+    /** Connection mode: "auto" / "udp" / "tcp". */
+    val transport: String = "auto",
 )
 
 data class HostDisplay(
@@ -99,6 +101,9 @@ data class StatsLine(
     val encodeP99Ms: Float = 0f,
     val lossPercent: Float = 0f,
     val framesRecovered: Int = 0,
+    /** The host's view of the connection: packet loss and round trip (0 = an older host). */
+    val pathLossPct: Float = 0f,
+    val pathRttMs: Float = 0f,
 )
 
 data class OfferedFile(val name: String, val size: Long, val isDir: Boolean)
@@ -123,6 +128,8 @@ sealed interface CoreEvent {
         val hdr: Boolean = false,
         /** The host knows virtual displays (protocol feature; the driver may still be missing). */
         val virtualDisplay: Boolean = false,
+        /** This connection is QUIC over TCP (else UDP). */
+        val tcp: Boolean = false,
     ) : CoreEvent
     data class Reconnecting(val message: String) : CoreEvent
     data class Disconnected(val message: String) : CoreEvent
@@ -170,6 +177,8 @@ sealed interface CoreEvent {
         val ok: Boolean,
         val message: String,
     ) : CoreEvent
+    /** The host cancelled transfer [id] (either direction). */
+    data class TransferCancelled(val id: String, val message: String) : CoreEvent
     data class FilesReceived(val id: String, val paths: List<String>) : CoreEvent
     data class Rumble(val index: Int, val large: Int, val small: Int) : CoreEvent
     data class ClipboardImage(val path: String) : CoreEvent
@@ -193,7 +202,7 @@ sealed interface CoreEvent {
                     s("serverName"), s("serverVersion"), s("serverFingerprint"), s("serverFingerprintShort"),
                     b("textInput"), b("fileTransfer"), b("gamepad"),
                     b("clipboardImage"), b("clipboardFiles"), b("microphone"), b("folderMount"), b("print"), b("usb"), b("hdr"),
-                    b("virtualDisplay"),
+                    b("virtualDisplay"), b("tcp"),
                 )
                 "reconnecting" -> Reconnecting(s("message"))
                 "disconnected" -> Disconnected(s("message"))
@@ -228,6 +237,7 @@ sealed interface CoreEvent {
                         f("encodeMs"), i("targetKbps"), i("fecPercent"), i("framesLost"), i("framesDropped"),
                         f("audioMs"), f("audioTargetMs"), i("audioUnderruns"),
                         i("serverKbps"), s("bitrateNote"), f("encodeP99Ms"), f("lossPercent"), i("framesRecovered"),
+                        f("pathLossPct"), f("pathRttMs"),
                     ),
                 )
                 "fileOffer" -> FileOffer(
@@ -243,7 +253,8 @@ sealed interface CoreEvent {
                     l("totalBytes"),
                 )
                 "transfer" -> Transfer(s("id"), b("upload"), s("name"), l("done"), l("total"), b("finished"), b("ok"), s("message"))
-                "filesReceived" -> FilesReceived(s("id"), o["paths"]?.jsonArray?.map { it.jsonPrimitive.content } ?: emptyList())
+                "transferCancelled" -> TransferCancelled(s("id"), s("message"))
+                "filesReceived" ->FilesReceived(s("id"), o["paths"]?.jsonArray?.map { it.jsonPrimitive.content } ?: emptyList())
                 "rumble" -> Rumble(i("index"), i("large"), i("small"))
                 "clipboardImage" -> ClipboardImage(s("path"))
                 "printJob" -> PrintJob(s("path"))

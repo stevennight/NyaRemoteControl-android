@@ -70,8 +70,17 @@ private val TRANSPORTS = listOf(
     Triple("datagram", "数据报 + 纠错", "丢包时靠纠错数据恢复，恢复不了就跳过这一帧，不卡顿；多占约 10–50% 带宽"),
 )
 
+private val CONNECTIONS = listOf(
+    Triple("auto", "自动", "优先 UDP；UDP 连不上或丢包严重时改用 TCP，UDP 恢复后自动换回"),
+    Triple("udp", "仅 UDP", "延迟最低；网络限制 UDP 时可能连不上或卡顿"),
+    Triple("tcp", "仅 TCP", "适合 UDP 不通或很差的网络；网络差时延迟比 UDP 高。端口转发需要同时转发 TCP"),
+)
+
 /** Choices of the policy menu in a session too. */
 val bitratePolicies: List<Triple<String, String, String>> get() = POLICIES
+
+/** Connection modes, in a session too. */
+val connectionModes: List<Triple<String, String, String>> get() = CONNECTIONS
 
 private enum class Preset { ASIS, EXTEND, PRIVATE }
 
@@ -126,7 +135,7 @@ fun ConnSettingsScreen(model: LauncherModel, scope: String?, onScope: (String?) 
             }
             Text(
                 when {
-                    host == null -> "没有单独设置的设备使用这里的设置。连接后在面板里改的画面模式、显示器、码率策略、麦克风、操作方式会记在那台设备的单独设置里。"
+                    host == null -> "没有单独设置的设备使用这里的设置。连接后在面板里改的画面模式、显示器、码率策略、连接方式、麦克风、操作方式会记在那台设备的单独设置里。"
                     host.settings != null -> "“${host.displayName}”使用单独的设置。"
                     else -> "“${host.displayName}”目前使用默认设置；在这里保存后改为单独设置，不影响其他设备。"
                 },
@@ -319,6 +328,9 @@ private fun PictureCard(d: ConnSettings, bitrateMode: String, onBitrateMode: (St
         }
         Field("网络变差时", POLICIES.find { it.first == d.bitratePolicy }?.third, stacked = true) {
             Select(POLICIES.map { it.first to it.second }, d.bitratePolicy) { v -> set { it.copy(bitratePolicy = v) } }
+        }
+        Field("连接方式", CONNECTIONS.find { it.first == d.transport }?.third, stacked = true) {
+            Select(CONNECTIONS.map { it.first to it.second }, d.transport) { v -> set { it.copy(transport = v) } }
         }
         Field("画面传输方式", TRANSPORTS.find { it.first == d.videoTransport }?.third, stacked = true) {
             Select(TRANSPORTS.map { it.first to it.second }, d.videoTransport) { v -> set { it.copy(videoTransport = v) } }

@@ -31,6 +31,10 @@ pub enum NetCmd {
     OfferFiles(Vec<std::path::PathBuf>),
     /// New list of shared folders.
     SetShares(nya_transport::folders::Shares),
+    /// Stop a transfer (both sides), dropping what was received of it.
+    CancelTransfer(u64),
+    /// Connection mode changed: reconnect if needed.
+    SetTransport(crate::net::Transport),
     Quit,
 }
 
@@ -206,7 +210,6 @@ impl Session {
             clip_out: Mutex::new(Default::default()),
             shares: Mutex::new(Arc::new(crate::options::shares(&cfg.shares))),
             usb: Default::default(),
-
         });
         runtime.spawn(crate::net::main(cfg, identity, shared.clone(), cmds_rx));
         Ok(Self {

@@ -9,12 +9,13 @@ NyaRemoteControl 的安卓客户端：用手机控制装了 NyaRemoteControl 被
 - 键盘：手机输入法照常使用（拼音、手写、语音）。被控端 ≥ 协议 1.5 时文字以 Unicode 打进电脑；更早的被控端上中文经电脑剪贴板粘贴，英文走按键。
 - 声音：Opus 硬件解码 + 与 Windows 客户端相同的自适应抖动缓冲。麦克风：手机麦克风传到电脑（Android 10+，电脑需装虚拟声卡；打开期间电脑的默认麦克风自动切到虚拟声卡，关掉后恢复）。手机上其他应用照样能用麦克风（前台应用优先），本应用在后台时不占用麦克风。
 - 剪贴板：文字、图片双向；手机上复制的文件可以在电脑上直接粘贴。
-- 文件：发送手机文件到电脑；电脑上复制文件后，手机提示"保存到手机"，存到 `下载/NyaRemoteControl`。
+- 文件：发送手机文件到电脑；电脑上复制文件后，手机提示"保存到手机"，存到 `下载/NyaRemoteControl`。被控端支持时（协议 1.6+）文件走 TCP（TLS 加密、SHA-256 校验），不和画面抢 QUIC 连接；TCP 不通时仍走 UDP。正在进行的传输可以点"取消"（两边都停止，没传完的文件删除）。
 - 共享文件夹：设置里选的手机文件夹在电脑上显示为一个盘符（电脑需装 WinFsp；手机需授予文件访问权限）。
 - 打印：电脑打印到"打印到 NyaRemoteControl 客户端"，手机上提示打印或保存。
 - USB：手机 OTG 接口上的设备共享给电脑（手机自己充当 USB/IP 服务端；不支持摄像头、声卡这类等时传输设备）。
 - 手柄：手机连接的手柄（USB / 蓝牙）变成电脑上的虚拟 Xbox 手柄，支持震动。
 - HDR：手机屏幕支持 HDR10 且电脑开着 HDR 时，以 HDR10 显示。
+- 连接方式（设置 → 连接方式，或会话中面板的"画面模式"）：**自动**（默认，优先 UDP；UDP 连不上、或丢包连续 20 秒超过 10% 时改用 TCP，UDP 恢复后自动换回）、**仅 UDP**、**仅 TCP**（整个会话走 TCP，适合 UDP 不通或很差的网络）。统计信息里能看到当前走的是哪一种。端口转发时 UDP 和 TCP 都要转发，外部端口号相同。
 - 多客户端（观看 / 接管 / 顶掉）、断线自动重连、实体键盘和鼠标、应用内更新（GitHub Releases）。
 
 ## 手势
@@ -35,7 +36,7 @@ NyaRemoteControl 的安卓客户端：用手机控制装了 NyaRemoteControl 被
 
 ```
 app/            Kotlin + Jetpack Compose：界面、MediaCodec 解码、音频、手势、键盘
-rust/src/       Rust 核心（libnya_android.so，JNI）：QUIC 连接、握手与配对、重连、视频数据报纠错、丢帧后等关键帧、抖动缓冲、文件收发、共享文件夹、USB/IP 服务端（usb.rs）
+rust/src/       Rust 核心（libnya_android.so，JNI）：QUIC 连接（UDP / TCP）、握手与配对、重连、视频数据报纠错、丢帧后等关键帧、抖动缓冲、文件收发、共享文件夹、USB/IP 服务端（usb.rs）
 Cargo.toml      Rust 核心；依赖 ../common 的 nya-proto / nya-transport / nya-jitter（与 Windows 客户端同一套代码）
 ```
 
@@ -53,7 +54,7 @@ NyaRemoteControl/
 
 ```bash
 ./gradlew assembleDebug        # Gradle 先用 cargo-ndk 编译 Rust 核心
-cargo test                      # Rust 核心测试：回环集成测试（假被控端：配对、视频、关键帧请求、文字输入、双向文件、共享文件夹），USB/IP 服务端（模拟设备）
+cargo test                      # Rust 核心测试：回环集成测试（假被控端：配对、视频、关键帧请求、文字输入、双向文件、共享文件夹；只开 TCP 的被控端：整个会话走 TCP、文件通道、两个方向的取消），USB/IP 服务端（模拟设备）
 ./gradlew testDebugUnitTest     # 手势、视口、按键映射、文字输入与粘贴回退、手柄映射、DIB 图片转换、版本比较等
 
 ```

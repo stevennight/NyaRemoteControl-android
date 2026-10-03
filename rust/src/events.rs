@@ -29,6 +29,8 @@ pub enum Event {
         usb: bool,
         hdr: bool,
         virtual_display: bool,
+        /// This connection is QUIC over TCP (else UDP).
+        tcp: bool,
     },
     Reconnecting {
         message: String,
@@ -113,6 +115,12 @@ pub enum Event {
         total: u64,
         finished: bool,
         ok: bool,
+        message: String,
+    },
+    /// The host cancelled transfer `id` (either direction): what is still
+    /// running of it ends; later reports of it change nothing.
+    TransferCancelled {
+        id: String,
         message: String,
     },
     /// A whole download batch is in `download_dir`.
@@ -201,6 +209,9 @@ pub struct StatsLine {
     pub audio_ms: f32,
     pub audio_target_ms: f32,
     pub audio_underruns: u32,
+    /// The host's view of the connection (protocol 1.8): packet loss and round trip.
+    pub path_loss_pct: f32,
+    pub path_rtt_ms: f32,
 }
 
 pub fn codec_name(c: i32) -> &'static str {
@@ -292,5 +303,9 @@ mod tests {
         let e = Event::VerifyFingerprint { fingerprint: "AB:CD".into() };
         assert_eq!(e.to_json(), r#"{"type":"verifyFingerprint","fingerprint":"AB:CD"}"#);
         assert_eq!(Event::PinChanged { message: "m".into() }.to_json(), r#"{"type":"pinChanged","message":"m"}"#);
+        let e = Event::TransferCancelled { id: "7".into(), message: "x".into() };
+        assert_eq!(e.to_json(), r#"{"type":"transferCancelled","id":"7","message":"x"}"#);
+        let e = Event::Stats(StatsLine { path_loss_pct: 12.5, path_rtt_ms: 40.0, ..Default::default() });
+        assert!(e.to_json().contains(r#""pathLossPct":12.5,"pathRttMs":40.0"#), "{}", e.to_json());
     }
 }

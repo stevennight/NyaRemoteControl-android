@@ -79,6 +79,7 @@ import app.nya.remote.ui.AccentCyan
 import app.nya.remote.ui.GestureGuide
 import app.nya.remote.ui.Seg
 import app.nya.remote.ui.bitratePolicies
+import app.nya.remote.ui.connectionModes
 import app.nya.remote.ui.muted
 import app.nya.remote.ui.sizeText
 import kotlin.math.roundToInt
@@ -90,8 +91,11 @@ sealed interface Status {
     data class Disconnected(val message: String) : Status
 }
 
-/** An upload or download in the transfers list. */
-data class TransferItem(val t: CoreEvent.Transfer, val savedTo: String? = null)
+/**
+ * An upload or download in the transfers list. [cancelled]: stopped here or
+ * by the host; what its tasks report afterwards changes nothing.
+ */
+data class TransferItem(val t: CoreEvent.Transfer, val savedTo: String? = null, val cancelled: Boolean = false)
 
 /** Observable state of the session screen. */
 class SessionUi(settings: ConnSettings, showStats: Boolean, showGuideOnConnect: Boolean) {
@@ -116,6 +120,8 @@ class SessionUi(settings: ConnSettings, showStats: Boolean, showGuideOnConnect: 
     var showGuideOnConnect by mutableStateOf(showGuideOnConnect)
     var stats by mutableStateOf<StatsLine?>(null)
     var stream by mutableStateOf<CoreEvent.StreamStarted?>(null)
+    /** The connection is QUIC over TCP (null before the first connection). */
+    var viaTcp by mutableStateOf<Boolean?>(null)
     var role by mutableStateOf<CoreEvent.Role?>(null)
     /** Short message while something changes ("正在切换到游戏模式…"); cleared when the stream (re)starts. */
     var notice by mutableStateOf("")
@@ -157,6 +163,8 @@ interface SessionActions {
     fun pcKeyboardHeight(px: Int)
     fun setGameMode(game: Boolean)
     fun setPolicy(policy: String)
+    /** Connection mode "auto" / "udp" / "tcp". */
+    fun setTransport(mode: String)
     fun setShowStats(show: Boolean)
     fun setShowGuideOnConnect(show: Boolean)
     fun sendSas()
@@ -175,6 +183,8 @@ interface SessionActions {
     fun acceptOffer(id: String)
     fun dismissOffer(id: String)
     fun dismissTransfer(id: String)
+    /** Stop a running transfer on both sides. */
+    fun cancelTransfer(id: String)
     fun openDownloads()
     fun submitPairCode(code: String?)
     fun checkAgain(retry: Boolean)
@@ -319,6 +329,9 @@ private fun TransferCard(item: TransferItem, actions: SessionActions) {
             Text(t.name, color = Color.White, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
             if (t.finished) {
                 Text("✕", color = Color(0xFFB8BBC2), fontSize = 15.sp, modifier = Modifier.clip(CircleShape).clickable { actions.dismissTransfer(t.id) }.padding(horizontal = 10.dp, vertical = 2.dp))
+            } else if (t.id.isNotEmpty()) {
+                // Stops it on both sides; what arrived of it is deleted.
+                Text("取消", color = AccentCyan, fontSize = 13.sp, modifier = Modifier.clip(RoundedCornerShape(8.dp)).clickable { actions.cancelTransfer(t.id) }.padding(horizontal = 10.dp, vertical = 2.dp))
             }
         }
         when {
@@ -375,6 +388,12 @@ fun statsLines(ui: SessionUi): List<String> {
         out += "传输  数据报 + 纠错 ${s.fecPercent}%%   丢包 %.1f%%   纠错恢复 ${s.framesRecovered} 帧   丢帧 ${s.framesLost}".format(s.lossPercent)
     }
     out += "延迟  端到端 %.1f ms   RTT %.1f ms".format(s.latencyMs, s.rttMs)
+    ui.viaTcp?.let { tcp ->
+        val mode = connectionModes.find { it.first == ui.settings.transport }?.second ?: "自动"
+        // The host's view of the path (hosts before protocol 1.8 send none).
+        val path = if (s.pathRttMs > 0f) "   丢包 %.1f%%   往返 %.0f ms".format(s.pathLossPct, s.pathRttMs) else ""
+        out += "连接  ${if (tcp) "TCP" else "UDP"}（$mode）$path"
+    }
     val p99 = if (s.encodeP99Ms > 0) "%.1f".format(s.encodeP99Ms) else "—"
     out += "耗时  编码 %.1f/%s（中位/P99）  解码 %.1f ms".format(s.encodeMs, p99, s.decodeMs)
     if (s.audioTargetMs > 0) {
@@ -524,6 +543,16 @@ private fun SidePanel(ui: SessionUi, actions: SessionActions) {
                     color = muted,
                 )
             }
+            val now = when (ui.viaTcp) {
+                true -> "（现在：TCP）"
+                false -> "（现在：UDP）"
+                null -> ""
+            }
+            Label("连接方式$now", Modifier.padding(top = 12.dp))
+            Box(Modifier.padding(top = 8.dp)) {
+                Seg(connectionModes.map { it.first to it.second }, ui.settings.transport) { actions.setTransport(it) }
+            }
+            Text(connectionModes.find { it.first == ui.settings.transport }?.third.orEmpty(), fontSize = 12.sp, color = muted, modifier = Modifier.padding(top = 6.dp))
             Row(Modifier.fillMaxWidth().padding(top = 10.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 Tile("还原缩放", Modifier.weight(1f)) {
                     ui.panelOpen = false

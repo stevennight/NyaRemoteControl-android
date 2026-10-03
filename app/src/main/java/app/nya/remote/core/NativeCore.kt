@@ -67,6 +67,12 @@ object NativeCore {
     /** An image copied on the phone, as CF_DIB bytes. */
     @JvmStatic external fun clipboardImage(handle: Long, dib: ByteArray)
 
+    /** Stop a running transfer (id as in its `transfer` events) on both sides; what was received of it is deleted. */
+    @JvmStatic external fun cancelTransfer(handle: Long, id: String)
+
+    /** Connection mode "auto" / "udp" / "tcp"; reconnects when the connection has to move. */
+    @JvmStatic external fun setTransport(handle: Long, mode: String)
+
     /** Files copied on the phone (paths of copies in the app's cache, JSON array), offered for pasting on the host. */
     @JvmStatic external fun clipboardFiles(handle: Long, pathsJson: String)
 

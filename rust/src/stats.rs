@@ -107,6 +107,8 @@ impl Stats {
             audio_ms: audio.level_ms,
             audio_target_ms: audio.target_ms,
             audio_underruns: audio.underruns,
+            path_loss_pct: server.path_loss_pct,
+            path_rtt_ms: server.path_rtt_ms,
         };
         let client = pb::ClientStats {
             decode_ms_p50: s.decode_ms,

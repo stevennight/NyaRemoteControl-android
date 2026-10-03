@@ -30,6 +30,8 @@ data class ConnSettings(
     val bitratePolicy: String = "auto",
     /** "auto" | "stream" | "datagram". */
     val videoTransport: String = "auto",
+    /** How the session travels: "auto" (UDP; TCP when UDP does not connect or loses too much) | "udp" | "tcp" (QUIC over TCP). */
+    val transport: String = "auto",
     /** 0 = the screen's refresh rate. */
     val maxFps: Int = 60,
     /** Host encoder: "auto" | "nvenc" | "qsv" | "amf" | "software". */
